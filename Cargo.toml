@@ -1,0 +1,16 @@
+[package]
+name = "wlmenu"
+version = "0.1.0"
+edition = "2024"
+description = "A wmenu/dmenu-style Wayland menu written in Rust"
+license = "MIT"
+repository = "https://github.com/codethare/wlmenu"
+readme = "README.md"
+keywords = ["dmenu", "wayland", "launcher", "wlr-layer-shell"]
+categories = ["command-line-utilities", "gui"]
+
+[dependencies]
+ab_glyph = "0.2.32"
+fontdb = "0.24.0"
+smithay-client-toolkit = "0.21.1"
+wayland-client = "0.31.14"

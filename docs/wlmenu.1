@@ -1,0 +1,203 @@
+.TH WLMENU 1 2026-09-10 wlmenu "User Commands"
+.SH NAME
+wlmenu \- a wmenu/dmenu-style dynamic menu for Wayland
+.SH SYNOPSIS
+.B wlmenu
+.RB [ \-biPv ]
+.RB [ \-f " font" ]
+.RB [ \-l " lines" ]
+.RB [ \-W " width" ]
+.RB [ \-p " prompt" ]
+.RB [ \-o " output" ]
+.RB [ \-N " color" ]\c
+.RB [ \-n " color" ]
+.RB [ \-M " color" ]\c
+.RB [ \-m " color" ]
+.RB [ \-S " color" ]\c
+.RB [ \-s " color" ]
+.br
+.B wlmenu \-\-run
+.SH DESCRIPTION
+.B wlmenu
+reads newline-separated items from standard input, filters them as the user
+types, and prints the selection to standard output.  It is a Wayland-native
+dmenu replacement using wlr-layer-shell; rendering is done in software
+(wl_shm), so it pulls in no cairo/pango stack.
+.PP
+The menu starts as a single input bar (Spotlight style) and expands into a
+list as soon as the query has content; clearing the query collapses it again.
+Without
+.B \-b
+the bar is centred horizontally and floats below the top screen edge.
+.PP
+With an empty query,
+.B Enter
+cancels rather than selecting blind.
+.SH OPTIONS
+.TP
+.B \-b
+Show the menu at the bottom of the screen instead of the upper centre.
+.TP
+.B \-i
+Match case-insensitively.
+.TP
+.B \-l " lines"
+Show at most
+.I lines
+item rows; the list scrolls beyond that.  Without it at most 64 rows are
+shown.
+.TP
+.B \-W " width"
+Panel width in logical pixels (default 640).
+.TP
+.B \-p " prompt"
+Prompt label drawn at the left of the input bar (for example
+.RB \(aq "run: " \(aq ).
+.TP
+.B \-P
+Mask the typed input with asterisks (password mode).  Filtering still sees
+the real query.
+.TP
+.BI \-f " font"
+Font to use.  Either a path to a
+.B .ttf
+file, or a family description:
+.RI \(dq FAMILY
+.RI [ style ]
+.RI [ pt | Npx ] \(dq.
+A bare size is interpreted as points, as in wmenu/Pango;
+.IB N px
+is pixels.  Without
+.B \-f
+a CJK-capable system font is picked automatically.
+.TP
+.BI \-o " output"
+Show the menu on the output with the given name (as reported by the
+compositor, for example
+.IR eDP-1 ).
+Without it the compositor chooses the output.  An unknown name is an error.
+.TP
+.BI \-N " color"
+Normal row background.
+.TP
+.BI \-n " color"
+Normal row foreground.
+.TP
+.BI \-M " color"
+Prompt/input row background.
+.TP
+.BI \-m " color"
+Prompt/input row foreground.
+.TP
+.BI \-S " color"
+Selected row background.
+.TP
+.BI \-s " color"
+Selected row foreground.
+.TP
+.B \-\-run
+Ignore stdin: list entries from
+.B .desktop
+files in the XDG application directories plus executables found on
+.BR PATH ,
+and launch the selection with
+.BR "sh \-c" .
+Desktop entries win when a name appears in both.  Hidden entries, entries that
+need a terminal (\fBTerminal=true\fR), entries restricted to other desktops
+(\fBOnlyShowIn\fR/\fBNotShowIn\fR), and non-executable files in
+\fBPATH\fR directories are skipped; a localized \fBName[locale]\fR is preferred
+when it matches the user's locale.
+.TP
+.B \-v ", " \-\-version
+Print the version and exit.
+.TP
+.B \-h ", " \-\-help
+Print usage and exit.
+.PP
+Colors are wmenu-style
+.B RRGGBB
+or
+.B RRGGBBAA
+hex values; a leading
+.B #
+is accepted.
+.SH KEYS
+.TP
+.B Up ", " Down ", " Ctrl\-n ", " Ctrl\-p
+Move the selection.
+.TP
+.B PgUp ", " PgDn ", " Home ", " End
+Move by a page, to the first, or to the last entry.
+.TP
+.B Return ", " KP_Enter ", " Ctrl\-j ", " Ctrl\-m
+Print the highlighted entry (or the typed query when nothing matches) and
+exit.
+.TP
+.B Shift\-Return
+Print exactly what was typed, even when something is highlighted.
+.TP
+.B Ctrl\-Return
+Print the highlighted entry and keep the menu open (repeat for multi-select).
+.TP
+.B Tab
+Complete the highlighted entry into the input bar.
+.TP
+.B Escape ", " Ctrl\-c ", " Ctrl\-g
+Cancel: exit without printing anything.
+.TP
+.B Ctrl\-h ", " Backspace
+Delete the character before the caret.
+.TP
+.B Ctrl\-u
+Clear the query.
+.TP
+.B Ctrl\-w
+Delete the word before the caret.
+.PP
+Any other printable character is appended to the query.
+.SH EXIT STATUS
+.TP
+.B 0
+An entry (or the typed query) was printed, or
+.B \-\-run
+launched a selection.
+.TP
+.B 1
+The menu was cancelled, stdin held no items, or an error occurred.
+.SH ENVIRONMENT
+.TP
+.B WAYLAND_DISPLAY
+Wayland socket to connect to (via
+.BR XDG_RUNTIME_DIR ).
+.TP
+.B XDG_DATA_HOME ", " XDG_DATA_DIRS
+Searched for
+.B .desktop
+entries in
+.B \-\-run
+mode.
+.TP
+.B XDG_CACHE_HOME
+The system font chain is cached here, keyed by the font directory mtimes.
+.SH EXAMPLES
+List files:
+.PP
+.EX
+$ ls | wlmenu \-p \(aqopen: \(aq
+.EE
+.PP
+Launcher bound to a key:
+.PP
+.EX
+$ wlmenu \-\-run
+.EE
+.PP
+Show on a specific output, case-insensitively, with width 500:
+.PP
+.EX
+$ printf \(aqa\\nb\\n\(aq | wlmenu \-i \-o DP-1 \-W 500
+.EE
+.SH SEE ALSO
+.BR wmenu (1),
+.BR dmenu (1),
+.BR sway (1)
