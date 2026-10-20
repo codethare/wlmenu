@@ -273,6 +273,7 @@ fn main() {
         password: opts.password,
         bottom: opts.bottom,
         output_w: None,
+        output_h: None,
         dirty: false,
         frame_pending: false,
         blink: true,
@@ -425,6 +426,18 @@ fn valid_width(w: u32) -> bool {
 /// `-l 0` means "auto" (see `row_capacity`); the cap keeps the pool hint sane.
 fn valid_lines(n: usize) -> bool {
     n <= MAX_LINES
+}
+
+/// List rows that fit on an output `output_h` logical px tall: the panel keeps
+/// `gap` free above and below it, one row of that budget is the input bar, and
+/// the rest is list. Saturating throughout, so a screen too short for a single
+/// row yields 0 instead of underflowing into a huge count.
+fn max_rows(output_h: u32, row_h: u32, gap: u32, scale: u32) -> usize {
+    let s = scale.max(1);
+    let budget = output_h
+        .saturating_mul(s)
+        .saturating_sub(gap.saturating_mul(2).saturating_mul(s));
+    (budget / row_h.max(1)).saturating_sub(1) as usize
 }
 
 /// Subpixel AA pays off on 1× outputs; on HiDPI the pixel grid is already dense,
@@ -652,9 +665,11 @@ struct App {
     colors: render::Colors,
     password: bool,
     bottom: bool,
-    /// Logical width of the output the panel is mapped on; `None` until
-    /// surface_enter, used to center the panel horizontally (Spotlight).
+    /// Logical size of the output the panel is mapped on; `None` until
+    /// surface_enter. The width centers the panel, the height caps the list so
+    /// the menu cannot grow past the screen.
     output_w: Option<u32>,
+    output_h: Option<u32>,
     dirty: bool,
     frame_pending: bool,
     /// Caret blink state and when to toggle it next (typing keeps it solid).
@@ -675,11 +690,37 @@ struct App {
 
 impl App {
     fn visible(&self) -> usize {
-        if self.lines > 0 {
-            self.lines.min(self.menu.matches.len())
+        let rows = if self.lines > 0 {
+            self.lines
         } else {
-            self.menu.matches.len().min(MAX_VISIBLE)
+            MAX_VISIBLE
+        };
+        // The screen is a physical limit, `-l` a preference: the smaller wins.
+        match self.screen_rows() {
+            Some(fit) => rows.min(fit),
+            None => rows,
         }
+        .min(self.menu.matches.len())
+    }
+
+    /// Rows that fit on this output with the panel's gaps above and below;
+    /// `None` until `surface_enter` reported the output height.
+    fn screen_rows(&self) -> Option<usize> {
+        // `row_h` is buffer px; before the font is joined the provisional height
+        // is the same value startup used to size the first commit.
+        let row_h = match &self.font {
+            Some(font) => font.row_h,
+            None => {
+                let size = font::spec_size(self.font_spec.as_deref(), FONT_SIZE);
+                font::row_h_for(size * self.scale as f32)
+            }
+        };
+        let gap = if self.bottom {
+            render::SHADOW
+        } else {
+            TOP_MARGIN as u32
+        };
+        Some(max_rows(self.output_h?, row_h, gap, self.scale))
     }
 
     /// True while stdin is still feeding items in (`--run` never streams).
@@ -1011,12 +1052,13 @@ impl CompositorHandler for App {
         let Some(info) = self.output_state.info(output) else {
             return;
         };
-        if let Some((w, _)) = info.logical_size
-            && self.output_w != Some(w.max(0) as u32)
-        {
-            let w = w.max(0) as u32;
-            self.output_w = Some(w); // center the panel on this output
-            self.request_draw();
+        if let Some((w, h)) = info.logical_size {
+            let (w, h) = (w.max(0) as u32, h.max(0) as u32);
+            if self.output_w != Some(w) || self.output_h != Some(h) {
+                self.output_w = Some(w); // center the panel on this output
+                self.output_h = Some(h); // and keep the list inside it
+                self.request_draw();
+            }
         }
         self.apply_scale(info.scale_factor);
     }
@@ -1236,6 +1278,28 @@ mod tests {
         assert!(!valid_width(MAX_WIDTH + 1));
         assert!(valid_lines(0) && valid_lines(MAX_LINES), "0 means auto");
         assert!(!valid_lines(MAX_LINES + 1));
+    }
+
+    /// The list stops where the panel would otherwise reach the screen edge: what
+    /// fits under the bar between two `gap` margins, not what `-l` asks for.
+    #[test]
+    fn list_fits_between_the_screen_margins() {
+        let (row, gap) = (30, 32);
+        // 1080 - 2*32 margin = 1016 for bar + rows.
+        assert_eq!(max_rows(1080, row, gap, 1), 32);
+        assert_eq!(max_rows(1440, row, gap, 1), 44);
+        assert_eq!(max_rows(2160, row, gap, 1), 68);
+        // HiDPI: the same logical output gives the same number of rows.
+        assert_eq!(max_rows(1080, row * 2, gap, 2), 32);
+        // Too short for one row, or an absurd height: no rows, no underflow.
+        assert_eq!(max_rows(2 * gap + row, row, gap, 1), 0);
+        assert_eq!(max_rows(0, row, gap, 1), 0);
+        assert!(
+            max_rows(1080, 0, gap, 1) <= 1080,
+            "a zero row height must not divide by zero"
+        );
+        // `-b` sits SHADOW from the bottom edge: symmetric around that gap.
+        assert_eq!(max_rows(1080, row, render::SHADOW, 1), 33);
     }
 
     #[test]
