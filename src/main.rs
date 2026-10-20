@@ -50,7 +50,10 @@ use wayland_client::{
 };
 
 const DEFAULT_WIDTH: u32 = 640;
-const FONT_SIZE: f32 = 16.0;
+/// Default body size in px (15 pt at 96 dpi). MacOS chrome sits at 13-15 pt, and
+/// 16 px read small next to it. The proportions follow from it: `row_h_for`
+/// keeps 1.5x line height (30 px) and `PAD` is 0.8 em, as in a mac menu.
+const FONT_SIZE: f32 = 20.0;
 /// Text antialiasing: LCD subpixel (`Rgb`) is noticeably sharper on 1× displays.
 /// Switch to `Bgr` for BGR-stripe panels (text would fringe on the wrong side)
 /// or `Gray` for neutral rendering without colour fringing.
