@@ -65,7 +65,9 @@ input as asterisks), `-i` (case-insensitive), `-l lines` (visible rows), `-W wid
 pixels — wmenu/Pango convention), `-v` (print version), `--run`, `-h`.
 
 Colors are wmenu-style `RRGGBB[AA]`: `-N` normal bg, `-n` normal fg, `-M` prompt bg,
-`-m` prompt fg, `-S` selection bg, `-s` selection fg. Example:
+`-m` prompt fg, `-S` selection bg, `-s` selection fg. The default backgrounds are
+translucent (`1e1e1ed4`, `2c2c2cdc`, `0b6285ee`); an alpha below `ff` blends the
+panel with the wallpaper. Example:
 
 ```sh
 printf 'alacritty\nfirefox\n' | wlmenu -N 111111 -n cccccc -S 005577 -s ffffff

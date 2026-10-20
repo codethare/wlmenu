@@ -12,6 +12,23 @@ pub const fn bgra(r: u8, g: u8, b: u8, a: u8) -> Bgra {
 /// Spotlight panel corner radius (logical px), clamped to half the panel size.
 pub const CORNER_RADIUS: u32 = 12;
 
+/// Space reserved around the panel for its drop shadow (logical px). The buffer
+/// and the layer surface grow by it; the panel keeps its size and position.
+pub const SHADOW: u32 = 24;
+
+/// Shadow layers as (blur radius, alpha at the panel edge, vertical offset),
+/// logical px and 0-255. A tight contact shadow under a wide ambient one; the
+/// offset is positive because the light comes from above.
+const SHADOW_TIGHT: (u32, u32, u32) = (7, 170, 2);
+const SHADOW_WIDE: (u32, u32, u32) = (17, 130, 6);
+// The margin must fit the widest layer, or its falloff is cut off at the buffer edge.
+const _: () = assert!(SHADOW >= SHADOW_WIDE.0 + SHADOW_WIDE.2);
+
+/// Hairline on the panel's outermost pixel — the seam between the translucent
+/// body and the shadow. Lit along the top, dark underneath, like window chrome.
+const BORDER_LIGHT_ALPHA: u32 = 34;
+const BORDER_DARK_ALPHA: u32 = 60;
+
 // Eye-comfort rules, checked at compile time (clippy: assertions on constants
 // belong here): the content inset must clear the corner radius so text never
 // grazes the curve, and the panel must float off the screen edge rather than
@@ -19,7 +36,7 @@ pub const CORNER_RADIUS: u32 = 12;
 const _: () = assert!(crate::PAD >= CORNER_RADIUS);
 const _: () = assert!(crate::TOP_MARGIN >= 32);
 
-/// Fully transparent pixel: everything outside the rounded panel outline.
+/// Fully transparent pixel: what the shadow margin holds every frame.
 const CLEAR: Bgra = [0, 0, 0, 0];
 
 /// Fixed gap between the prompt label and the typed input (8px grid).
@@ -34,11 +51,13 @@ const LABEL_RAIL_W: u32 = 4;
 const DIVIDER_H: u32 = 1;
 const DIVIDER_ALPHA: u32 = 64;
 
-pub const BG_NORMAL: Bgra = bgra(0x22, 0x22, 0x22, 0xff);
+/// Translucent glass body: the alpha is what the compositor blends with the
+/// wallpaper, so the buffer is premultiplied (`draw` does that).
+pub const BG_NORMAL: Bgra = bgra(0x1e, 0x1e, 0x1e, 0xd4);
 pub const FG_NORMAL: Bgra = bgra(0xbb, 0xbb, 0xbb, 0xff);
 /// Input bar: a subtly lighter tone than the list, so bar and list read as
 /// separate pieces of one panel.
-pub const BG_PROMPT: Bgra = bgra(0x2e, 0x2e, 0x2e, 0xff);
+pub const BG_PROMPT: Bgra = bgra(0x2c, 0x2c, 0x2c, 0xdc);
 pub const FG_PROMPT: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
 /// Prompt label accent: a 4px rail on the input bar's left edge (option F); a
 /// deep slate blue that carries the emphasis while staying harmonious with the
@@ -47,7 +66,7 @@ pub const LABEL_ACCENT: Bgra = bgra(0x2e, 0x4a, 0x5c, 0xff);
 /// Selected row. The background is darker than the old `0f7ca6` so white text
 /// clears WCAG AA: `#ffffff` on `#0b6285` is 6.77:1 (the previous pair was
 /// 4.06:1 — the weakest contrast in the whole UI, on the row that matters most).
-pub const BG_SEL: Bgra = bgra(0x0b, 0x62, 0x85, 0xff);
+pub const BG_SEL: Bgra = bgra(0x0b, 0x62, 0x85, 0xee);
 pub const FG_SEL: Bgra = bgra(0xff, 0xff, 0xff, 0xff);
 
 /// Menu color scheme, wmenu-style (defaults match the old hardcoded constants).
@@ -114,20 +133,30 @@ pub struct Row<'a> {
 /// (x0 inclusive, x1 exclusive). Corner pixels fall outside the span;
 /// middle rows span the full width. Radius is clamped to half a dimension.
 pub fn rounded_span(w: u32, h: u32, r: u32, y: u32) -> (u32, u32) {
+    if y >= h {
+        return (0, 0);
+    }
+    let inset = rounded_inset(w, h, r, y).ceil() as u32;
+    (inset.min(w), w.saturating_sub(inset))
+}
+
+/// Fractional horizontal inset of the rounded outline at row `y`. Rounding it
+/// up gives the whole-pixel span; the fraction left over is the coverage of the
+/// pixel just outside that span, which is what antialiases the edge.
+pub fn rounded_inset(w: u32, h: u32, r: u32, y: u32) -> f64 {
     let r = r.min(w / 2).min(h / 2);
-    if r == 0 {
-        return if y < h { (0, w) } else { (0, 0) };
+    if r == 0 || y >= h {
+        return 0.0;
     }
     let rr = (r * r) as f64;
     let py = y as f64 + 0.5;
     let top = r as f64;
     let bottom = h as f64 - r as f64;
     if py >= top && py <= bottom {
-        return (0, w);
+        return 0.0;
     }
     let dy = if py < top { top - py } else { py - bottom };
-    let inset = (r as f64 - (rr - dy * dy).max(0.0).sqrt()).ceil() as u32;
-    (inset.min(w), w.saturating_sub(inset))
+    r as f64 - (rr - dy * dy).max(0.0).sqrt()
 }
 
 /// Scrollbar thumb `(y, h)` for a `visible`-row viewport over `total` items at
@@ -158,6 +187,175 @@ fn set_span(buf: &mut [u8], w: u32, y: u32, x0: u32, x1: u32, color: Bgra) {
     }
 }
 
+/// Premultiply a straight colour: wl_shm ARGB8888 is premultiplied, so a
+/// translucent body has to be written as `rgb * a`, not as `rgb` next to an
+/// alpha byte (the compositor would blend a too-bright panel).
+fn premul(c: Bgra) -> Bgra {
+    let a = c[3] as u32;
+    [
+        (c[0] as u32 * a / 255) as u8,
+        (c[1] as u32 * a / 255) as u8,
+        (c[2] as u32 * a / 255) as u8,
+        c[3],
+    ]
+}
+
+/// Composite an already premultiplied source over a premultiplied destination
+/// with `cov` (0-255) attenuating it — edge coverage, or a border layer.
+#[inline]
+fn over_pm(dst: &mut [u8], src: Bgra, cov: u32) {
+    let sa = src[3] as u32 * cov / 255;
+    let inv = 255 - sa;
+    for c in 0..3 {
+        dst[c] = ((src[c] as u32 * cov / 255) + dst[c] as u32 * inv / 255) as u8;
+    }
+    dst[3] = (sa + dst[3] as u32 * inv / 255) as u8;
+}
+
+/// The panel inside the shadow margin: origin and size in buffer px, plus the
+/// rounded outline that the body, its antialiased edge, the hairline and the
+/// shadow are all derived from. One outline for all four is what keeps the
+/// border and the shadow from leaving a seam between them.
+#[derive(Clone, Copy)]
+struct Panel {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    r: u32,
+}
+
+impl Panel {
+    /// Whole-pixel span `[x0, x1)` of panel-relative row `rel` in buffer coords.
+    fn span(&self, rel: u32) -> (u32, u32) {
+        let (x0, x1) = rounded_span(self.w, self.h, self.r, rel);
+        (self.x + x0, self.x + x1)
+    }
+}
+
+/// Both drop-shadow layers in one pass. They share the panel outline, so each
+/// pixel gets its alpha from both LUTs and is written once: no read-modify-write
+/// between layers, and the band needs no clear (which is why the frame does not
+/// start with a full-buffer memset).
+fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel, scale: u32) {
+    // (blur, vertical offset, alpha by squared distance)
+    let s = scale.max(1);
+    let layers: [(u32, i64, Vec<u32>); 2] =
+        [SHADOW_WIDE, SHADOW_TIGHT].map(|(blur, a0, offset)| {
+            let b = (blur * s).max(1);
+            let offset = (offset * s) as i64;
+            let lut = (0..=b * b)
+                .map(|d2| {
+                    // A blurred edge starts at half the peak and eases out: a ramp
+                    // from the full value leaves a visible cusp where it begins.
+                    let t = (d2 as f64).sqrt() / b as f64;
+                    (a0 as f64 * 0.5 * (1.0 + (std::f64::consts::PI * t).cos())).round() as u32
+                })
+                .collect();
+            (b, offset, lut)
+        });
+    let reach = layers.iter().map(|l| l.0).max().unwrap_or(1);
+    // Alpha by horizontal distance, rebuilt per row: the two LUTs are combined
+    // once per column distance instead of once per shadow pixel.
+    let mut band = vec![0u8; reach as usize + 1];
+    // Rows inside the panel all share dv = 0, so the band is usually built once.
+    let mut cached = [u32::MAX; 2];
+    for by in 0..h {
+        let y = by as i64;
+        // Per layer: squared row distance from the shifted body, clamped to the
+        // layer's blur (the offset is what hangs the shadow below the panel).
+        let dv: [u32; 2] = [0, 1].map(|k| {
+            let (b, offset, _) = &layers[k];
+            let top = panel.y as i64 + *offset;
+            let bottom = top + panel.h as i64;
+            let d = if y < top {
+                top - y
+            } else if y >= bottom {
+                y - bottom + 1
+            } else {
+                0
+            };
+            let d = d.min(*b as i64) as u32;
+            d * d
+        });
+        // The outline row comes from the body itself, not from the offset shape:
+        // both layers must see the same span, or their falloffs leave a stripe
+        // where one starts further out than the other.
+        let rel = (y - panel.y as i64).clamp(0, panel.h as i64 - 1) as u32;
+        let (x0, x1) = panel.span(rel);
+        let start = x0.saturating_sub(reach);
+        let end = (x1 + reach).min(w);
+        // Everything the band does not cover is emptied: a reused buffer slot
+        // still holds the previous frame.
+        if start > 0 {
+            set_span(buf, w, by, 0, start, CLEAR);
+        }
+        if end < w {
+            set_span(buf, w, by, end, w, CLEAR);
+        }
+        let visible = (0..2).any(|k| dv[k] < layers[k].0 * layers[k].0);
+        if !visible {
+            if start < end {
+                set_span(buf, w, by, start, end, CLEAR);
+            }
+            continue;
+        }
+        if dv != cached {
+            cached = dv;
+            for (dx, out) in band.iter_mut().enumerate() {
+                let dx2 = (dx * dx) as u32;
+                let mut a = 0u32;
+                for (k, (b, _, lut)) in layers.iter().enumerate() {
+                    let la = lut[(dx2 + dv[k]).min(b * b) as usize];
+                    a = la + div255(a * (255 - la));
+                }
+                *out = a as u8;
+            }
+        }
+        // Two bands outside the outline; the body itself is painted later, so
+        // it is stepped over rather than tested per pixel.
+        if by >= panel.y && by < panel.y + panel.h {
+            put_band(buf, w, by, start..x0.min(end), (x0, x1), Side::Left, &band);
+            put_band(buf, w, by, x1.max(start)..end, (x0, x1), Side::Right, &band);
+        } else {
+            put_band(buf, w, by, start..end, (x0, x1), Side::Row, &band);
+        }
+    }
+}
+
+/// Which part of an outline row a shadow band covers.
+#[derive(Clone, Copy)]
+enum Side {
+    Left,
+    Right,
+    /// The whole row: the body is not there, so the middle is shadow too.
+    Row,
+}
+
+/// Writes one row's shadow band: premultiplied black, so only the alpha byte.
+fn put_band(
+    buf: &mut [u8],
+    w: u32,
+    by: u32,
+    xs: std::ops::Range<u32>,
+    (x0, x1): (u32, u32),
+    side: Side,
+    band: &[u8],
+) {
+    for x in xs {
+        let dx = match side {
+            Side::Left => x0 - 1 - x,
+            Side::Right => x - x1,
+            Side::Row if x < x0 => x0 - 1 - x,
+            Side::Row if x >= x1 => x - x1,
+            Side::Row => 0,
+        };
+        let a = band[(dx as usize).min(band.len() - 1)];
+        let dst = &mut buf[((by * w + x) * 4) as usize..][..4];
+        dst.copy_from_slice(&[0, 0, 0, a]);
+    }
+}
+
 /// Draws the full frame. `buf` is `w*h*4` bytes in BGRA order.
 /// The first row is the prompt/input row, the rest are `rows`.
 /// `scale` is the buffer-to-logical density (HiDPI): `padding` and this
@@ -182,76 +380,115 @@ pub fn draw(
     let row_h = font.row_h;
     // Buffer-pixel geometry derived from the logical constants.
     let p = padding * s;
-    let corner = CORNER_RADIUS * s;
+    let mo = SHADOW * s;
     let rail_w = LABEL_RAIL_W * s;
     let vpad = PILL_VPAD * s;
     let gap = PROMPT_GAP * s as f32;
     // `-P` masks the typed text; filtering still sees the real query.
     let query = masked_input(query, password);
 
-    // Panel: rounded corners (transparent outside), input bar and list sharing
-    // one outline, separated by a subtle divider and background difference.
-    // One pass, one write per pixel. The buffer can be a different slot each
-    // frame, so pixels outside the rounded outline must be written too — but the
-    // panel itself must not be painted twice (that second full-buffer write was
-    // the bulk of a HiDPI frame: 4.8 ms at scale 2 with 64 rows).
-    let r = corner.min(h / 2);
-    for y in 0..h {
-        let (x0, x1) = rounded_span(w, h, r, y);
-        let bg = if y < row_h {
-            colors.bg_prompt
-        } else {
-            colors.bg_normal
-        };
-        if x0 > 0 {
-            set_span(buf, w, y, 0, x0, CLEAR);
+    // The buffer is the panel plus its shadow margin. The shadow pass also
+    // empties everything it does not paint (the buffer can be a different slot
+    // each frame), so there is no separate clear.
+    if w <= 2 * mo || h <= 2 * mo {
+        buf.fill(0);
+        return;
+    }
+    let panel = Panel {
+        x: mo,
+        y: mo,
+        w: w - 2 * mo,
+        h: h - 2 * mo,
+        r: CORNER_RADIUS * s,
+    };
+    shadow(buf, w, h, &panel, s);
+
+    // Body: whole-pixel spans, premultiplied, one write per pixel. What is left
+    // of the fractional corner inset is the coverage of the single pixel just
+    // outside the span, which is what antialiases the rounded edge (no extra
+    // pass, no per-pixel distance field).
+    let (bg_normal, bg_prompt, bg_sel) = (
+        premul(colors.bg_normal),
+        premul(colors.bg_prompt),
+        premul(colors.bg_sel),
+    );
+    for by in panel.y..panel.y + panel.h {
+        let rel = by - panel.y;
+        let inset = rounded_inset(panel.w, panel.h, panel.r, rel);
+        let (x0, x1) = panel.span(rel);
+        let bg = if rel < row_h { bg_prompt } else { bg_normal };
+        set_span(buf, w, by, x0, x1, bg);
+        let cov = ((inset.ceil() - inset) * 255.0).round() as u32;
+        if cov > 0 && x0 > 0 {
+            over_pm(&mut buf[(by * w + x0 - 1) as usize * 4..][..4], bg, cov);
         }
-        set_span(buf, w, y, x0, x1, bg);
-        if x1 < w {
-            set_span(buf, w, y, x1, w, CLEAR);
+        if cov > 0 && x1 < w {
+            over_pm(&mut buf[(by * w + x1) as usize * 4..][..4], bg, cov);
+        }
+        // Hairline on the panel's outermost pixel: the seam where the body meets
+        // the shadow. Lit along the top (fading out over the first third), dark
+        // underneath, so the shadow reads as growing out of the edge.
+        let t = 1.0 - rel as f32 / panel.h as f32;
+        let light = (BORDER_LIGHT_ALPHA as f32 * t * t).round() as u32;
+        if x0 < x1 {
+            for x in [x0, x1 - 1] {
+                let dst = &mut buf[(by * w + x) as usize * 4..][..4];
+                over_pm(dst, [0, 0, 0, 0xff], BORDER_DARK_ALPHA);
+                over_pm(dst, [0xff, 0xff, 0xff, 0xff], light);
+            }
         }
     }
 
-    if h > row_h {
+    if panel.h > row_h {
         let divider_h = DIVIDER_H * s;
         let divider_y = row_h - divider_h;
-        let (x0, x1) = rounded_span(w, h, r, divider_y);
-        let mut divider = colors.bg_prompt;
-        blend_px(
-            &mut divider,
-            [
-                colors.label_accent[0],
-                colors.label_accent[1],
-                colors.label_accent[2],
-            ],
-            DIVIDER_ALPHA,
-        );
-        rect(buf, w, h, x0, divider_y, x1 - x0, divider_h, divider);
+        // Inset by the content padding: the hairline separates bar from list
+        // without touching the border ring.
+        let (x0, x1) = panel.span(divider_y);
+        let mut divider = bg_prompt;
+        over_pm(&mut divider, colors.label_accent, DIVIDER_ALPHA);
+        let (dx0, dx1) = (x0 + p, x1.saturating_sub(p));
+        for by in divider_y..divider_y + divider_h {
+            if dx0 < dx1 {
+                set_span(buf, w, panel.y + by, dx0, dx1, divider);
+            }
+        }
     }
 
     // Prompt / input row text.
-    let baseline = row_baseline(font, 0);
+    let left = panel.x as f32;
+    let right = (panel.x + panel.w) as f32;
+    let baseline = row_baseline(font, panel.y);
     // The prompt label ("address") sits on a compact capsule, rounded on both
     // sides, so the bar background stays uniformly bg_prompt (identical to the
     // normal, prompt-less input bar).
-    let mut x = p as f32;
+    let mut x = left + p as f32;
     if !prompt.is_empty() {
         // Option F: a 4px accent rail on the bar's left edge, the label text
         // 8px past it — no enclosing shape, so the bar stays uniformly
         // bg_prompt and the visual mass is minimal.
         let rail_h = font.line_h.ceil() as u32 + 2 * vpad;
         let rail_y = (font.row_h - rail_h) / 2;
-        rect(buf, w, h, p, rail_y, rail_w, rail_h, colors.label_accent);
+        rect(
+            buf,
+            w,
+            h,
+            panel.x + p,
+            panel.y + rail_y,
+            rail_w,
+            rail_h,
+            colors.label_accent,
+        );
         x = draw_text(
             buf,
             w,
             h,
             font,
-            p as f32 + rail_w as f32 + gap,
+            left + p as f32 + rail_w as f32 + gap,
             baseline,
             prompt,
             colors.fg_prompt,
-            (w - 2 * p) as f32,
+            (panel.w - 2 * p) as f32,
             subpixel,
         );
         // Eye-comfort: fixed on-grid gap between the label text and the first
@@ -269,7 +506,7 @@ pub fn draw(
             baseline,
             &query,
             colors.fg_prompt,
-            w as f32 - x - p as f32,
+            right - x - p as f32,
             subpixel,
         );
     }
@@ -285,7 +522,7 @@ pub fn draw(
             buf,
             w,
             h,
-            caret_x.min(w.saturating_sub(caret_w)),
+            caret_x.min((right as u32).saturating_sub(caret_w)),
             caret_top,
             caret_w,
             caret_bottom - caret_top,
@@ -296,11 +533,18 @@ pub fn draw(
     // Item rows (background already bg_normal from the panel pass; only the
     // selected row needs an override, clipped to the rounded outline).
     for (i, row) in rows.iter().enumerate() {
-        let y = row_h * (i as u32 + 1);
+        let rel = row_h * (i as u32 + 1);
+        if rel >= panel.h {
+            break;
+        }
         if row.selected {
-            for yy in y..(y + row_h).min(h) {
-                let (x0, x1) = rounded_span(w, h, r, yy);
-                set_span(buf, w, yy, x0, x1, colors.bg_sel);
+            for yy in rel..(rel + row_h).min(panel.h) {
+                // Inside the hairline: the ring frames the selection instead of
+                // being painted over by it.
+                let (x0, x1) = panel.span(yy);
+                if x0 + 1 < x1 {
+                    set_span(buf, w, panel.y + yy, x0 + 1, x1 - 1, bg_sel);
+                }
             }
         }
         let fg = if row.selected {
@@ -313,11 +557,11 @@ pub fn draw(
             w,
             h,
             font,
-            p as f32,
-            row_baseline(font, y),
+            left + p as f32,
+            row_baseline(font, panel.y + rel),
             row.text,
             fg,
-            w as f32 - 2.0 * p as f32,
+            (panel.w - 2 * p) as f32,
             subpixel,
         );
     }
@@ -332,7 +576,8 @@ pub fn rect(buf: &mut [u8], w: u32, h: u32, x: u32, y: u32, rw: u32, rh: u32, co
     for py in y0..y1 {
         let row = &mut buf[(py * w + x0) as usize * 4..(py * w + x1) as usize * 4];
         for px in row.as_chunks_mut::<4>().0 {
-            *px = color;
+            // Composite, not overwrite: the panel under it may be translucent.
+            blend_px(px, [color[0], color[1], color[2]], color[3] as u32);
         }
     }
 }
@@ -561,7 +806,12 @@ fn blit_plane(
             let dst = &mut buf[((py as u32 * w + px as u32) * 4) as usize..][..4];
             match chan {
                 None => blend_px(dst, [color[0], color[1], color[2]], a),
-                Some(c) => dst[c] = ((color[c] as u32 * a + dst[c] as u32 * (255 - a)) / 255) as u8,
+                Some(c) => {
+                    dst[c] = ((color[c] as u32 * a + dst[c] as u32 * (255 - a)) / 255) as u8;
+                    // Each subpixel plane covers part of the pixel; the planes
+                    // together lerp the alpha towards opaque, as `blend_px` does.
+                    dst[3] = (a + dst[3] as u32 * (255 - a) / 255) as u8;
+                }
             }
         }
     }
@@ -576,13 +826,24 @@ fn masked_input(query: &str, password: bool) -> String {
     }
 }
 
+/// `x / 255` for `x <= 255 * 255`, without the hardware divide: this runs once
+/// per shadow pixel per layer, where the compiler's `/ 255` costs more than the
+/// rest of the pixel put together.
+#[inline]
+fn div255(x: u32) -> u32 {
+    (x + 1 + (x >> 8)) >> 8
+}
+
 #[inline]
 fn blend_px(dst: &mut [u8], src: [u8; 3], a: u32) {
     let inv = 255 - a;
     dst[0] = ((src[0] as u32 * a + dst[0] as u32 * inv) / 255) as u8;
     dst[1] = ((src[1] as u32 * a + dst[1] as u32 * inv) / 255) as u8;
     dst[2] = ((src[2] as u32 * a + dst[2] as u32 * inv) / 255) as u8;
-    // dst alpha stays 255 (fully opaque menu)
+    // src is opaque here (its alpha is already folded into `a`), so "src over"
+    // in premultiplied space also moves the destination alpha towards opaque —
+    // without this, ink over a translucent panel would stay translucent.
+    dst[3] = (a + dst[3] as u32 * inv / 255) as u8;
 }
 
 #[cfg(test)]
@@ -590,12 +851,30 @@ mod tests {
     use super::*;
     use crate::font::MenuFont;
 
+    /// Buffer size for a panel of `w`×`h` buffer px at `scale`: the panel plus
+    /// its shadow margin on both sides.
+    fn frame_size(w: u32, h: u32, scale: u32) -> (u32, u32) {
+        (w + 2 * SHADOW * scale, h + 2 * SHADOW * scale)
+    }
+
+    /// Byte index of panel-relative (x, y) in a buffer `bw` px wide.
+    fn idx(bw: u32, scale: u32, x: u32, y: u32) -> usize {
+        let mo = SHADOW * scale;
+        (((y + mo) * bw + x + mo) * 4) as usize
+    }
+
+    /// A panel colour as the buffer holds it: premultiplied.
+    fn pm(c: Bgra) -> Bgra {
+        premul(c)
+    }
+
     /// Headless render check: draws a real frame (text incl. CJK) to a raw BGRA dump.
     #[test]
     fn renders_frame_with_cjk_text() {
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (320u32, font.row_h * 4);
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let (bw, bh) = frame_size(w, h, 1);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
 
         let colors = Colors::default();
         let rows = [
@@ -614,8 +893,8 @@ mod tests {
         ];
         draw(
             &mut buf,
-            w,
-            h,
+            bw,
+            bh,
             &font,
             "run: ",
             "fir",
@@ -628,21 +907,18 @@ mod tests {
             Subpixel::Gray,
         );
 
+        let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
         // Selected row (rows[0]) has the selection background.
-        let sel_px = &buf[(font.row_h * w + w / 2) as usize * 4..][..4];
-        assert_eq!(sel_px, &colors.bg_sel);
+        assert_eq!(px(w / 2, font.row_h + 1), &pm(colors.bg_sel));
         // Normal row (rows[1]) has the normal background.
-        let norm_px = &buf[(font.row_h * 2 * w + w / 2) as usize * 4..][..4];
-        assert_eq!(norm_px, &colors.bg_normal);
+        assert_eq!(px(w / 2, font.row_h * 2 + 1), &pm(colors.bg_normal));
         // Prompt row has the prompt background.
-        let prompt_px = &buf[(w / 2) as usize * 4..][..4];
-        assert_eq!(prompt_px, &colors.bg_prompt);
+        assert_eq!(px(w / 2, 1), &pm(colors.bg_prompt));
         // First text row must contain non-background pixels (glyph ink).
         let mut text_has_ink = false;
         'outer: for y in 2..24u32 {
             for x in crate::PAD..200u32 {
-                let i = ((font.row_h + y) * w + x) as usize * 4;
-                if [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]] != colors.bg_sel {
+                if px(x, font.row_h + y) != pm(colors.bg_sel) {
                     text_has_ink = true;
                     break 'outer;
                 }
@@ -657,12 +933,13 @@ mod tests {
     fn subpixel_aa_is_per_channel_and_order_symmetric() {
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (240u32, font.row_h);
+        let (bw, bh) = frame_size(w, h, 1);
         let render = |aa: Subpixel| {
-            let mut buf = vec![0u8; (w * h * 4) as usize];
+            let mut buf = vec![0u8; (bw * bh * 4) as usize];
             draw(
                 &mut buf,
-                w,
-                h,
+                bw,
+                bh,
                 &font,
                 "",
                 "firim",
@@ -703,16 +980,17 @@ mod tests {
     fn glyph_cache_is_reused_across_frames() {
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (320u32, font.row_h * 2);
+        let (bw, bh) = frame_size(w, h, 1);
         let colors = Colors::default();
         let rows = [Row {
             text: "Firefox 火狐",
             selected: true,
         }];
-        let mut a = vec![0u8; (w * h * 4) as usize];
+        let mut a = vec![0u8; (bw * bh * 4) as usize];
         draw(
             &mut a,
-            w,
-            h,
+            bw,
+            bh,
             &font,
             "run:",
             "fir",
@@ -727,11 +1005,11 @@ mod tests {
         let cached = font.glyphs.borrow().len();
         assert!(cached > 0, "the first frame must populate the cache");
 
-        let mut b = vec![0u8; (w * h * 4) as usize];
+        let mut b = vec![0u8; (bw * bh * 4) as usize];
         draw(
             &mut b,
-            w,
-            h,
+            bw,
+            bh,
             &font,
             "run:",
             "fir",
@@ -752,11 +1030,12 @@ mod tests {
     fn renders_cjk_via_fallback_when_primary_is_latin() {
         let font = MenuFont::load(Some("Noto Sans Mono"), 16.0).expect("system font available");
         let (w, h) = (320u32, font.row_h);
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let (bw, bh) = frame_size(w, h, 1);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
         draw(
             &mut buf,
-            w,
-            h,
+            bw,
+            bh,
             &font,
             "",
             "火狐",
@@ -769,11 +1048,11 @@ mod tests {
             Subpixel::Gray,
         );
         // Prompt row bg is BG_PROMPT; any pixel differing from it is glyph ink.
-        let bg = Colors::default().bg_prompt;
+        let bg = pm(Colors::default().bg_prompt);
         let mut ink = false;
         'o: for y in 2..h - 2 {
             for x in 2..w - 2 {
-                let i = (y * w + x) as usize * 4;
+                let i = idx(bw, 1, x, y);
                 if [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]] != bg {
                     ink = true;
                     break 'o;
@@ -787,12 +1066,13 @@ mod tests {
     fn rounded_corner_pixels_are_transparent_inside_is_opaque() {
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (200u32, font.row_h * 3);
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let (bw, bh) = frame_size(w, h, 1);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
         let colors = Colors::default();
         draw(
             &mut buf,
-            w,
-            h,
+            bw,
+            bh,
             &font,
             "",
             "fir",
@@ -804,16 +1084,132 @@ mod tests {
             true,
             Subpixel::Gray,
         );
-        let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
+        let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
 
-        // All four corner pixels are fully transparent.
-        assert_eq!(px(0, 0), &[0, 0, 0, 0]);
-        assert_eq!(px(w - 1, 0), &[0, 0, 0, 0]);
-        assert_eq!(px(0, h - 1), &[0, 0, 0, 0]);
-        assert_eq!(px(w - 1, h - 1), &[0, 0, 0, 0]);
-        // The interior near a corner is opaque and opaque panel-colored.
-        assert_eq!(px(6, 2)[3], 0xff);
-        assert_eq!(px(w / 2, h / 2), &colors.bg_normal);
+        // The rounded corner is outside the body, so the shadow behind the glass
+        // shows through: small alpha, no colour of its own.
+        for (x, y) in [(0, 0), (w - 1, h - 1)] {
+            assert_eq!(px(x, y)[..3], [0, 0, 0], "shadow only at ({x},{y})");
+            assert!(px(x, y)[3] < colors.bg_normal[3] / 2, "{x},{y}");
+        }
+        // The panel body is translucent glass, premultiplied.
+        assert_eq!(px(w / 2, h / 2), &pm(colors.bg_normal));
+        assert!(
+            px(6, 2)[0] < px(6, 2)[3],
+            "a premultiplied body cannot be brighter than its alpha"
+        );
+        // One pixel above the panel's first row is shadowed but not panel.
+        let edge = &buf[idx(bw, 1, w / 2, 0) - bw as usize * 4..][..4];
+        assert!(edge[3] > 0 && edge[3] < colors.bg_prompt[3], "{edge:?}");
+    }
+
+    /// The corner outline antialiases: the pixel just outside a corner row's
+    /// span is partially covered, so its alpha sits between shadow and body.
+    #[test]
+    fn panel_corner_edge_is_antialiased() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (200u32, font.row_h * 3);
+        let (bw, bh) = frame_size(w, h, 1);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
+        let colors = Colors::default();
+        draw(
+            &mut buf,
+            bw,
+            bh,
+            &font,
+            "",
+            "",
+            false,
+            &[],
+            crate::PAD,
+            &colors,
+            1,
+            false,
+            Subpixel::Gray,
+        );
+        let inset = rounded_inset(w, h, CORNER_RADIUS, 0);
+        let cov = inset.ceil() - inset;
+        assert!(cov > 0.01, "first row should cut the corner: {inset}");
+        let x = inset.ceil() as u32 - 1;
+        let a = &buf[idx(bw, 1, x, 0)..][..4];
+        assert!(
+            a[3] > 0 && a[3] < colors.bg_prompt[3],
+            "edge pixel alpha {} must be partial",
+            a[3]
+        );
+        // Two pixels further in is the body itself (x + 1 is the hairline).
+        assert_eq!(&buf[idx(bw, 1, x + 2, 0)..][..4], &pm(colors.bg_prompt));
+    }
+
+    /// The hairline sits on the panel's outermost pixel and is darker than the
+    /// body, so the glass edge reads as one line with the shadow under it.
+    #[test]
+    fn border_ring_is_one_pixel_wide() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (200u32, font.row_h * 3);
+        let (bw, bh) = frame_size(w, h, 1);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
+        let colors = Colors::default();
+        draw(
+            &mut buf,
+            bw,
+            bh,
+            &font,
+            "",
+            "",
+            false,
+            &[],
+            crate::PAD,
+            &colors,
+            1,
+            false,
+            Subpixel::Gray,
+        );
+        let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
+        let mid = h / 2;
+        assert_eq!(px(1, mid), &pm(colors.bg_normal), "body starts at x=1");
+        assert_ne!(px(0, mid), &pm(colors.bg_normal), "ring at x=0");
+        // Lit along the top, dark along the bottom: that is what makes the edge
+        // read as a glass rim instead of a hard cut. Rows inside the corner
+        // radius, where x=0 is outside the body.
+        let top = CORNER_RADIUS + 4;
+        let bottom = h - CORNER_RADIUS - 1;
+        assert!(px(0, top)[0] > px(1, top)[0], "top rim is lit");
+        assert!(px(0, bottom)[0] < px(1, bottom)[0], "bottom rim is dark");
+    }
+
+    /// The shadow decays with distance from the outline and stops at the margin,
+    /// while the body itself is never shadowed.
+    #[test]
+    fn shadow_falls_off_outside_the_panel() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (200u32, font.row_h * 3);
+        let (bw, bh) = frame_size(w, h, 1);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
+        let colors = Colors::default();
+        draw(
+            &mut buf,
+            bw,
+            bh,
+            &font,
+            "",
+            "",
+            false,
+            &[],
+            crate::PAD,
+            &colors,
+            1,
+            false,
+            Subpixel::Gray,
+        );
+        // Straight above the panel's left side, in absolute buffer rows.
+        let x = SHADOW + 40;
+        let alpha = |back: u32| buf[((SHADOW - back) * bw + x) as usize * 4 + 3];
+        assert!(alpha(1) > alpha(8), "shadow decays with distance");
+        assert_eq!(alpha(SHADOW), 0, "nothing past the shadow margin");
+        // The body is opaque to the shadow behind it.
+        let (px, py) = (SHADOW + w / 2, SHADOW + h / 2);
+        assert_eq!(buf[((py * bw + px) * 4) as usize + 3], colors.bg_normal[3]);
     }
 
     #[test]
@@ -844,11 +1240,12 @@ mod tests {
 
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (200u32, font.row_h * 2);
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let (bw, bh) = frame_size(w, h, 1);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
         draw(
             &mut buf,
-            w,
-            h,
+            bw,
+            bh,
             &font,
             "",
             "x",
@@ -863,22 +1260,23 @@ mod tests {
             true,
             Subpixel::Gray,
         );
-        let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
+        let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
         // Input bar row uses bg_prompt, the list row below it bg_normal.
-        assert_eq!(px(w / 2, 2), &def.bg_prompt);
-        assert_eq!(px(w / 2, font.row_h + 2), &def.bg_normal);
+        assert_eq!(px(w / 2, 2), &pm(def.bg_prompt));
+        assert_eq!(px(w / 2, font.row_h + 2), &pm(def.bg_normal));
     }
 
     #[test]
     fn selected_row_covers_full_width_and_list_has_divider() {
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (240u32, font.row_h * 2);
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let (bw, bh) = frame_size(w, h, 1);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
         let colors = Colors::default();
         draw(
             &mut buf,
-            w,
-            h,
+            bw,
+            bh,
             &font,
             "",
             "",
@@ -893,20 +1291,30 @@ mod tests {
             false,
             Subpixel::Gray,
         );
-        let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
+        let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
 
         let selection_y = font.row_h + 1;
-        assert_eq!(px(0, selection_y), &colors.bg_sel);
-        assert_eq!(px(w - 1, selection_y), &colors.bg_sel);
-        assert_eq!(px(0, h - 1), &CLEAR, "outer corner stays transparent");
-        assert_eq!(px(w - 1, h - 1), &CLEAR);
+        // Full width inside the hairline ring at x=0 / x=w-1.
+        assert_eq!(px(1, selection_y), &pm(colors.bg_sel));
+        assert_eq!(px(w - 2, selection_y), &pm(colors.bg_sel));
+        assert_ne!(
+            px(0, selection_y),
+            &pm(colors.bg_sel),
+            "ring, not selection"
+        );
+        assert_ne!(
+            px(w - 1, selection_y),
+            &pm(colors.bg_sel),
+            "ring, not selection"
+        );
 
+        // The divider is its own tone, between the bar and the accent.
         let divider = px(w / 2, font.row_h - 1);
-        assert_ne!(divider, &colors.bg_prompt);
-        assert_ne!(divider, &colors.bg_normal);
+        assert_ne!(divider, &pm(colors.bg_prompt));
+        assert_ne!(divider, &pm(colors.bg_normal));
         for (c, value) in divider.iter().copied().take(3).enumerate() {
-            assert!(value >= colors.bg_prompt[c].min(colors.label_accent[c]));
-            assert!(value <= colors.bg_prompt[c].max(colors.label_accent[c]));
+            assert!(value >= pm(colors.bg_prompt)[c].min(colors.label_accent[c]));
+            assert!(value <= pm(colors.bg_prompt)[c].max(colors.label_accent[c]));
         }
     }
 
@@ -920,11 +1328,12 @@ mod tests {
 
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (240u32, font.row_h);
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let (bw, bh) = frame_size(w, h, 1);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
         draw(
             &mut buf,
-            w,
-            h,
+            bw,
+            bh,
             &font,
             "address",
             "",
@@ -936,7 +1345,7 @@ mod tests {
             true,
             Subpixel::Gray,
         );
-        let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
+        let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
 
         let rail_h = font.line_h.ceil() as u32 + 2 * PILL_VPAD;
         let rail_y = (font.row_h - rail_h) / 2;
@@ -953,30 +1362,34 @@ mod tests {
         );
         assert_eq!(
             px(crate::PAD + LABEL_RAIL_W, mid),
-            &def.bg_prompt,
+            &pm(def.bg_prompt),
             "just past the rail"
         );
         assert_eq!(
             px(crate::PAD + 8, mid),
-            &def.bg_prompt,
+            &pm(def.bg_prompt),
             "between rail and label text"
         );
-        assert_eq!(px(w - 10, mid), &def.bg_prompt);
+        assert_eq!(px(w - 10, mid), &pm(def.bg_prompt));
         // Rail is vertically centered at the same height the capsule had.
         assert_eq!(px(crate::PAD, rail_y), &def.label_accent, "rail top");
-        assert_eq!(px(crate::PAD, rail_y - 1), &def.bg_prompt, "above the rail");
+        assert_eq!(
+            px(crate::PAD, rail_y - 1),
+            &pm(def.bg_prompt),
+            "above the rail"
+        );
         assert_eq!(
             px(crate::PAD, rail_y + rail_h),
-            &def.bg_prompt,
+            &pm(def.bg_prompt),
             "below the rail"
         );
 
         // Empty prompt → no rail; the whole bar stays bg_prompt.
-        let mut buf2 = vec![0u8; (w * h * 4) as usize];
+        let mut buf2 = vec![0u8; (bw * bh * 4) as usize];
         draw(
             &mut buf2,
-            w,
-            h,
+            bw,
+            bh,
             &font,
             "",
             "x",
@@ -989,8 +1402,8 @@ mod tests {
             Subpixel::Gray,
         );
         assert_eq!(
-            &buf2[((mid * w + crate::PAD) * 4) as usize..][..4],
-            &def.bg_prompt
+            &buf2[idx(bw, 1, crate::PAD, mid)..][..4],
+            &pm(def.bg_prompt)
         );
     }
 
@@ -999,12 +1412,13 @@ mod tests {
     fn caret_can_be_hidden_for_blinking() {
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (200u32, font.row_h);
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let (bw, bh) = frame_size(w, h, 1);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
         let colors = Colors::default();
         draw(
             &mut buf,
-            w,
-            h,
+            bw,
+            bh,
             &font,
             "",
             "fir",
@@ -1017,7 +1431,7 @@ mod tests {
             Subpixel::Gray,
         );
         let mid = font.row_h / 2;
-        let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
+        let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
         let solid = (1..w - 3)
             .any(|x| px(x, mid) == colors.fg_prompt && px(x + 1, mid) == colors.fg_prompt);
         assert!(!solid, "blinked-off caret must not be drawn");
@@ -1136,12 +1550,13 @@ mod tests {
     fn hidpi_scale_doubles_the_buffer_geometry() {
         let font = MenuFont::load(None, 32.0).expect("system font available");
         let (w, h) = (480u32, font.row_h * 2);
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let (bw, bh) = frame_size(w, h, 2);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
         let def = Colors::default();
         draw(
             &mut buf,
-            w,
-            h,
+            bw,
+            bh,
             &font,
             "address",
             "",
@@ -1156,7 +1571,7 @@ mod tests {
             true,
             Subpixel::Gray,
         );
-        let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
+        let px = |x: u32, y: u32| &buf[idx(bw, 2, x, y)..][..4];
         let mid = font.row_h / 2;
 
         // Padding 16 -> 32, rail width 4 -> 8.
@@ -1173,19 +1588,21 @@ mod tests {
         );
         assert_eq!(
             px(rail_x + 2 * LABEL_RAIL_W, mid),
-            &def.bg_prompt,
+            &pm(def.bg_prompt),
             "past the scaled rail"
         );
 
         let selection_y = font.row_h + 1;
-        assert_eq!(px(0, selection_y), &def.bg_sel);
-        assert_eq!(px(w - 1, selection_y), &def.bg_sel);
+        assert_eq!(px(1, selection_y), &pm(def.bg_sel));
+        assert_eq!(px(w - 2, selection_y), &pm(def.bg_sel));
         assert_ne!(
             px(w / 2, font.row_h - 1),
-            &def.bg_prompt,
+            &pm(def.bg_prompt),
             "logical divider scales to physical pixels"
         );
 
+        // The shadow margin scales too: 2 * 24 logical px each side.
+        assert_eq!(bw - w, 4 * SHADOW);
         // Panel corner radius 12 -> 24: the first buffer row is inset further.
         let (x0, _) = rounded_span(w, h, CORNER_RADIUS * 2, 0);
         assert!(x0 > CORNER_RADIUS, "corner inset scales with density: {x0}");
@@ -1246,12 +1663,13 @@ mod tests {
         fn caret_is_solid_bar_just_past_query_spanning_text_block() {
             let font = MenuFont::load(None, 16.0).expect("system font available");
             let (w, h) = (200u32, font.row_h);
-            let mut buf = vec![0u8; (w * h * 4) as usize];
+            let (bw, bh) = frame_size(w, h, 1);
+            let mut buf = vec![0u8; (bw * bh * 4) as usize];
             let colors = Colors::default();
             draw(
                 &mut buf,
-                w,
-                h,
+                bw,
+                bh,
                 &font,
                 "",
                 "fir",
@@ -1263,10 +1681,11 @@ mod tests {
                 true,
                 Subpixel::Gray,
             );
-            let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
+            let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
 
             // A solid (non-antialiased) 2px-wide fg_prompt column = the caret;
-            // glyph ink is always anti-aliased, so it can't fake this.
+            // glyph ink is always anti-aliased, so it can't fake this. It also
+            // proves ink over the translucent body raises alpha to opaque.
             let mid = font.row_h / 2;
             let mut caret_x = None;
             for x in 1..w - 3 {
@@ -1313,15 +1732,16 @@ mod tests {
             let font = MenuFont::load(None, 16.0).expect("system font available");
             let (w, h) = (300u32, font.row_h);
             let colors = Colors::default();
-            let mut buf = vec![0u8; (w * h * 4) as usize];
+            let (bw, bh) = frame_size(w, h, 1);
+            let mut buf = vec![0u8; (bw * bh * 4) as usize];
             // Locate the solid 2px caret (same detector as the test above) for a
             // given prompt; the query "fir" and caret stay identical in both frames.
             let mut caret_x = |prompt: &str| -> u32 {
                 buf.fill(0);
                 draw(
                     &mut buf,
-                    w,
-                    h,
+                    bw,
+                    bh,
                     &font,
                     prompt,
                     "fir",
@@ -1334,7 +1754,7 @@ mod tests {
                     Subpixel::Gray,
                 );
                 let mid = font.row_h / 2;
-                let at = |x: u32| &buf[((mid * w + x) * 4) as usize..][..4];
+                let at = |x: u32| &buf[idx(bw, 1, x, mid)..][..4];
                 for x in 1..w - 3 {
                     if at(x) == colors.fg_prompt
                         && at(x + 1) == colors.fg_prompt

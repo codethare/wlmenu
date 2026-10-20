@@ -57,8 +57,11 @@ const FONT_SIZE: f32 = 16.0;
 const TEXT_AA: render::Subpixel = render::Subpixel::Rgb;
 /// Panel content inset: must be >= corner radius so text never grazes the curve.
 const PAD: u32 = 16;
-/// Away-from-edge float for the upper-center panel (bottom mode keeps 8px).
+/// Away-from-edge float for the upper-center panel (bottom mode floats too).
 const TOP_MARGIN: i32 = 32;
+// The panel sits inside the shadow margin, so the surface margin is the visible
+// gap minus the margin the shadow already occupies.
+const _: () = assert!(TOP_MARGIN >= render::SHADOW as i32);
 /// ponytail: stdin can be huge; cap drawn rows and scroll instead of mapping a giant buffer.
 const MAX_VISIBLE: usize = 64;
 /// Rows of context kept above/below the selection while the list scrolls.
@@ -233,8 +236,12 @@ fn main() {
 
     let output_state = OutputState::new(&globals, &qh);
     let height = bar_h * (row_capacity(opts.lines) as u32 + 1);
-    let pool = SlotPool::new((opts.width * height * 4) as usize, &shm)
-        .expect("failed to allocate shm pool");
+    let shadow = 2 * render::SHADOW;
+    let pool = SlotPool::new(
+        ((opts.width + shadow) * (height + shadow) * 4) as usize,
+        &shm,
+    )
+    .expect("failed to allocate shm pool");
     let item_count = items.len();
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -343,11 +350,14 @@ fn main() {
     } else {
         Anchor::TOP
     });
-    layer.set_margin(if app.bottom { 8 } else { TOP_MARGIN }, 0, 0, 0);
+    layer.set_margin(if app.bottom { 0 } else { TOP_MARGIN }, 0, 0, 0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
     // Start collapsed to the single input bar (Spotlight); the list appears
     // once the query has content. The pool keeps the max height for rows.
-    layer.set_size(app.width, bar_h);
+    // The surface carries the panel plus its shadow margin on both sides, so the
+    // margin above is the panel's visible gap to the screen edge minus that
+    // margin.
+    layer.set_size(app.width + shadow, bar_h + shadow);
     layer.commit();
     app.layer = Some(layer);
 
@@ -838,6 +848,7 @@ impl App {
 
         let scale = self.scale;
         let w = self.width;
+        let mo = render::SHADOW * scale;
         // `row_h` already includes the density, so heights here are buffer
         // pixels; the layer surface itself is sized in logical pixels.
         let row_h = font.row_h;
@@ -862,23 +873,31 @@ impl App {
             self.anim = None;
         }
         self.shown_h = h;
+        // The shadow margin hangs into the screen edge, so the surface margin is
+        // the panel's visible gap minus that margin: the panel keeps its old
+        // position at the top, and floats there in bottom mode too.
+        let shadow = render::SHADOW as i32;
         if self.bottom {
-            layer.set_margin(8, 0, 0, 0);
+            layer.set_margin(0, 0, 0, 0);
         } else {
-            // Upper-center: 24px top breathing room, horizontally centered.
+            // Upper-center, horizontally centered on the whole surface.
             let left = self
                 .output_w
-                .map(|ow| ((ow as i64 - w as i64) / 2).max(0) as i32)
+                .map(|ow| ((ow as i64 - (w + 2 * render::SHADOW) as i64) / 2).max(0) as i32)
                 .unwrap_or(0);
-            layer.set_margin(TOP_MARGIN, 0, 0, left);
+            layer.set_margin(TOP_MARGIN - shadow, 0, 0, left);
         }
-        layer.set_size(w, h.div_ceil(scale));
+        layer.set_size(
+            w + 2 * render::SHADOW,
+            h.div_ceil(scale) + 2 * render::SHADOW,
+        );
         let _ = layer.set_buffer_scale(scale);
 
-        let bw = w * scale;
+        let bw = (w + 2 * render::SHADOW) * scale;
+        let bh = h + 2 * render::SHADOW * scale;
         let (buffer, canvas) = match self.pool.create_buffer(
             bw as i32,
-            h as i32,
+            bh as i32,
             (bw * 4) as i32,
             wl_shm::Format::Argb8888,
         ) {
@@ -892,7 +911,7 @@ impl App {
         render::draw(
             canvas,
             bw,
-            h,
+            bh,
             font,
             &self.prompt,
             &self.menu.query,
@@ -911,11 +930,20 @@ impl App {
         {
             let pad = PAD * scale;
             let tw = 3 * scale;
-            let tx = bw - pad + pad.saturating_sub(tw) / 2;
-            render::rect(canvas, bw, h, tx, ty, tw, th, self.colors.label_accent);
+            let tx = bw - mo - (pad + tw) / 2;
+            render::rect(
+                canvas,
+                bw,
+                bh,
+                tx,
+                ty + mo,
+                tw,
+                th,
+                self.colors.label_accent,
+            );
         }
 
-        layer.wl_surface().damage_buffer(0, 0, bw as i32, h as i32);
+        layer.wl_surface().damage_buffer(0, 0, bw as i32, bh as i32);
         let surface = layer.wl_surface().clone();
         surface.frame(&self.qh, FrameCallbackData(surface.clone()));
         if buffer.attach_to(layer.wl_surface()).is_err() {
