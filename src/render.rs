@@ -45,9 +45,9 @@ const PROMPT_GAP: f32 = 8.0;
 const PILL_VPAD: u32 = 2;
 /// Width of the label rail.
 const LABEL_RAIL_W: u32 = 4;
-/// A logical-pixel divider at the input/list boundary.
-const DIVIDER_H: u32 = 1;
-const DIVIDER_ALPHA: u32 = 64;
+/// Gap between the input bar and the result list (logical px): they are two
+/// cards, the way Spotlight floats its field above the results.
+pub const SEPARATION: u32 = 8;
 
 /// Translucent glass body: the alpha is what the compositor blends with the
 /// wallpaper, so the buffer is premultiplied (`draw` does that).
@@ -231,13 +231,13 @@ impl Panel {
     }
 }
 
-/// Both drop-shadow layers in one pass. They share the panel outline, so each
-/// pixel gets its alpha from both LUTs and is written once: no read-modify-write
-/// between layers, and the band needs no clear (which is why the frame does not
-/// start with a full-buffer memset).
-fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel, scale: u32) {
-    // (blur, vertical offset, alpha by squared distance)
+/// Both drop-shadow layers for every card in one pass: the cards' bands are
+/// union-ed (a pixel takes the strongest shadow touching it) and each pixel is
+/// written once, so the pass also empties what it does not paint — which is why
+/// the frame does not start with a full-buffer memset.
+fn shadow(buf: &mut [u8], w: u32, h: u32, panels: &[Panel], scale: u32) {
     let s = scale.max(1);
+    // (blur, vertical offset, alpha by squared distance)
     let layers: [(u32, i64, Vec<u32>); 2] =
         [SHADOW_WIDE, SHADOW_TIGHT].map(|(blur, a0, offset)| {
             let b = (blur * s).max(1);
@@ -253,104 +253,153 @@ fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel, scale: u32) {
             (b, offset, lut)
         });
     let reach = layers.iter().map(|l| l.0).max().unwrap_or(1);
-    // Alpha by horizontal distance, rebuilt per row: the two LUTs are combined
-    // once per column distance instead of once per shadow pixel.
+    // Row distance per card per layer, refilled for every row.
+    let mut dvs = [[0u32; 2]; 2];
+    // Alpha by horizontal distance for rows with a single active card, rebuilt
+    // only when that card's row distance changes (once per card per frame).
     let mut band = vec![0u8; reach as usize + 1];
-    // Rows inside the panel all share dv = 0, so the band is usually built once.
     let mut cached = [u32::MAX; 2];
     for by in 0..h {
         let y = by as i64;
-        // Per layer: squared row distance from the shifted body, clamped to the
-        // layer's blur (the offset is what hangs the shadow below the panel).
-        let dv: [u32; 2] = [0, 1].map(|k| {
-            let (b, offset, _) = &layers[k];
-            let top = panel.y as i64 + *offset;
-            let bottom = top + panel.h as i64;
-            let d = if y < top {
-                top - y
-            } else if y >= bottom {
-                y - bottom + 1
-            } else {
-                0
-            };
-            let d = d.min(*b as i64) as u32;
-            d * d
-        });
-        // The outline row comes from the body itself, not from the offset shape:
-        // both layers must see the same span, or their falloffs leave a stripe
-        // where one starts further out than the other.
-        let rel = (y - panel.y as i64).clamp(0, panel.h as i64 - 1) as u32;
-        let (x0, x1) = panel.span(rel);
-        let start = x0.saturating_sub(reach);
-        let end = (x1 + reach).min(w);
-        // Everything the band does not cover is emptied: a reused buffer slot
-        // still holds the previous frame.
+        let mut start = w;
+        let mut end = 0u32;
+        let mut reached = false;
+        // Per card: row distance per layer, its outline span, and its body rows.
+        let mut spans: [(u32, u32, bool); 2] = [(0, 0, false); 2];
+        for (m, panel) in panels.iter().enumerate().take(2) {
+            let dv: [u32; 2] = [0, 1].map(|k| {
+                let (b, offset, _) = &layers[k];
+                let top = panel.y as i64 + *offset;
+                let bottom = top + panel.h as i64;
+                let d = if y < top {
+                    top - y
+                } else if y >= bottom {
+                    y - bottom + 1
+                } else {
+                    0
+                };
+                let d = d.min(*b as i64) as u32;
+                d * d
+            });
+            // The outline row comes from the body itself, not from the offset
+            // shape: both layers must see the same span, or their falloffs leave
+            // a stripe where one starts further out than the other.
+            let rel = (y - panel.y as i64).clamp(0, panel.h as i64 - 1) as u32;
+            let (x0, x1) = panel.span(rel);
+            spans[m] = (x0, x1, by >= panel.y && by < panel.y + panel.h);
+            start = start.min(x0.saturating_sub(reach));
+            end = end.max((x1 + reach).min(w));
+            reached |= (0..2).any(|k| dv[k] < layers[k].0 * layers[k].0);
+            dvs[m] = dv;
+        }
+        // Everything the bands do not cover is emptied: a reused buffer slot still
+        // holds the previous frame.
         if start > 0 {
             set_span(buf, w, by, 0, start, CLEAR);
         }
         if end < w {
             set_span(buf, w, by, end, w, CLEAR);
         }
-        let visible = (0..2).any(|k| dv[k] < layers[k].0 * layers[k].0);
-        if !visible {
+        if !reached {
             if start < end {
                 set_span(buf, w, by, start, end, CLEAR);
             }
             continue;
         }
-        if dv != cached {
-            cached = dv;
+        // The card whose body covers this row is painted later, so its span is
+        // stepped over instead of tested per pixel: what is left of the band is
+        // the strip left of that span and the strip right of it.
+        let body = spans
+            .iter()
+            .take(panels.len())
+            .position(|&(_, _, body)| body);
+        let (bl, br) = body.map_or((end, end), |m| {
+            let (x0, x1, _) = spans[m];
+            (x0.min(end), x1.max(start))
+        });
+        // Panels with a layer still fading at this row; usually one, and then its
+        // alpha is a function of `dx` alone and comes from a row-level table.
+        let active: Vec<usize> = (0..panels.len())
+            .filter(|&m| (0..2).any(|k| dvs[m][k] < layers[k].0 * layers[k].0))
+            .collect();
+        let only = (active.len() == 1).then(|| active[0]);
+        if let Some(m) = only
+            && dvs[m] != cached
+        {
+            cached = dvs[m];
             for (dx, out) in band.iter_mut().enumerate() {
                 let dx2 = (dx * dx) as u32;
                 let mut a = 0u32;
                 for (k, (b, _, lut)) in layers.iter().enumerate() {
-                    let la = lut[(dx2 + dv[k]).min(b * b) as usize];
+                    let la = lut[(dx2 + dvs[m][k]).min(b * b) as usize];
                     a = la + div255(a * (255 - la));
                 }
                 *out = a as u8;
             }
         }
-        // Two bands outside the outline; the body itself is painted later, so
-        // it is stepped over rather than tested per pixel.
-        if by >= panel.y && by < panel.y + panel.h {
-            put_band(buf, w, by, start..x0.min(end), (x0, x1), Side::Left, &band);
-            put_band(buf, w, by, x1.max(start)..end, (x0, x1), Side::Right, &band);
-        } else {
-            put_band(buf, w, by, start..end, (x0, x1), Side::Row, &band);
+        for (from, to) in [(start, bl), (br, end)] {
+            for x in from..to {
+                let a = match only {
+                    Some(m) => {
+                        let (x0, x1, _) = spans[m];
+                        let dx = if x < x0 {
+                            x0 - 1 - x
+                        } else {
+                            x.saturating_sub(x1)
+                        };
+                        band[(dx as usize).min(reach as usize)]
+                    }
+                    None => {
+                        let mut a = 0u32;
+                        for (k, (b, _, lut)) in layers.iter().enumerate() {
+                            let mut la = 0u32;
+                            for &m in &active {
+                                let (x0, x1, _) = spans[m];
+                                let dx = if x < x0 {
+                                    x0 - 1 - x
+                                } else {
+                                    x.saturating_sub(x1)
+                                };
+                                la = la.max(lut[(dx * dx + dvs[m][k]).min(b * b) as usize]);
+                            }
+                            a = la + div255(a * (255 - la));
+                        }
+                        a as u8
+                    }
+                };
+                let dst = &mut buf[((by * w + x) * 4) as usize..][..4];
+                dst.copy_from_slice(&[0, 0, 0, a]);
+            }
         }
     }
 }
 
-/// Which part of an outline row a shadow band covers.
-#[derive(Clone, Copy)]
-enum Side {
-    Left,
-    Right,
-    /// The whole row: the body is not there, so the middle is shadow too.
-    Row,
-}
-
-/// Writes one row's shadow band: premultiplied black, so only the alpha byte.
-fn put_band(
-    buf: &mut [u8],
-    w: u32,
-    by: u32,
-    xs: std::ops::Range<u32>,
-    (x0, x1): (u32, u32),
-    side: Side,
-    band: &[u8],
-) {
-    for x in xs {
-        let dx = match side {
-            Side::Left => x0 - 1 - x,
-            Side::Right => x - x1,
-            Side::Row if x < x0 => x0 - 1 - x,
-            Side::Row if x >= x1 => x - x1,
-            Side::Row => 0,
-        };
-        let a = band[(dx as usize).min(band.len() - 1)];
-        let dst = &mut buf[((by * w + x) * 4) as usize..][..4];
-        dst.copy_from_slice(&[0, 0, 0, a]);
+/// One card: rounded body fill, 1 px coverage antialiasing on both sides, and
+/// the hairline rim that makes its edge read as glass against the shadow.
+fn body(buf: &mut [u8], w: u32, panel: &Panel, bg: Bgra) {
+    for by in panel.y..panel.y + panel.h {
+        let rel = by - panel.y;
+        let (x0, x1) = panel.span(rel);
+        set_span(buf, w, by, x0, x1, bg);
+        let inset = rounded_inset(panel.w, panel.h, panel.r, rel);
+        let cov = ((inset.ceil() - inset) * 255.0).round() as u32;
+        if cov > 0 && x0 > 0 {
+            over_pm(&mut buf[(by * w + x0 - 1) as usize * 4..][..4], bg, cov);
+        }
+        if cov > 0 && x1 < w {
+            over_pm(&mut buf[(by * w + x1) as usize * 4..][..4], bg, cov);
+        }
+        // Hairline on the outermost pixel: the seam where the body meets the
+        // shadow. Lit along the top, fading out over the card, dark underneath.
+        let t = 1.0 - rel as f32 / panel.h as f32;
+        let light = (BORDER_LIGHT_ALPHA as f32 * t * t).round() as u32;
+        if x0 < x1 {
+            for x in [x0, x1 - 1] {
+                let dst = &mut buf[(by * w + x) as usize * 4..][..4];
+                over_pm(dst, [0, 0, 0, 0xff], BORDER_DARK_ALPHA);
+                over_pm(dst, [0xff, 0xff, 0xff, 0xff], light);
+            }
+        }
     }
 }
 
@@ -392,71 +441,47 @@ pub fn draw(
         buf.fill(0);
         return;
     }
-    let panel = Panel {
+    let column = Panel {
         x: mo,
         y: mo,
         w: w - 2 * mo,
         h: h - 2 * mo,
         r: CORNER_RADIUS * s,
     };
-    shadow(buf, w, h, &panel, s);
+    // Two cards: the input bar, and the list floating `sep` below it.
+    let sep = SEPARATION * s;
+    let bar = Panel {
+        h: row_h.min(column.h),
+        ..column
+    };
+    let list = (column.h > bar.h + sep).then(|| Panel {
+        y: bar.y + bar.h + sep,
+        h: column.h - bar.h - sep,
+        ..column
+    });
+    let panels: Vec<Panel> = match list {
+        Some(l) => vec![bar, l],
+        None => vec![bar],
+    };
+    shadow(buf, w, h, &panels, s);
 
     // Body: whole-pixel spans, premultiplied, one write per pixel. What is left
     // of the fractional corner inset is the coverage of the single pixel just
-    // outside the span, which is what antialiases the rounded edge (no extra
-    // pass, no per-pixel distance field).
+    // outside the span, which is what antialiases the rounded edge.
     let (bg_normal, bg_prompt, bg_sel) = (
         premul(colors.bg_normal),
         premul(colors.bg_prompt),
         premul(colors.bg_sel),
     );
-    for by in panel.y..panel.y + panel.h {
-        let rel = by - panel.y;
-        let inset = rounded_inset(panel.w, panel.h, panel.r, rel);
-        let (x0, x1) = panel.span(rel);
-        let bg = if rel < row_h { bg_prompt } else { bg_normal };
-        set_span(buf, w, by, x0, x1, bg);
-        let cov = ((inset.ceil() - inset) * 255.0).round() as u32;
-        if cov > 0 && x0 > 0 {
-            over_pm(&mut buf[(by * w + x0 - 1) as usize * 4..][..4], bg, cov);
-        }
-        if cov > 0 && x1 < w {
-            over_pm(&mut buf[(by * w + x1) as usize * 4..][..4], bg, cov);
-        }
-        // Hairline on the panel's outermost pixel: the seam where the body meets
-        // the shadow. Lit along the top (fading out over the first third), dark
-        // underneath, so the shadow reads as growing out of the edge.
-        let t = 1.0 - rel as f32 / panel.h as f32;
-        let light = (BORDER_LIGHT_ALPHA as f32 * t * t).round() as u32;
-        if x0 < x1 {
-            for x in [x0, x1 - 1] {
-                let dst = &mut buf[(by * w + x) as usize * 4..][..4];
-                over_pm(dst, [0, 0, 0, 0xff], BORDER_DARK_ALPHA);
-                over_pm(dst, [0xff, 0xff, 0xff, 0xff], light);
-            }
-        }
-    }
-
-    if panel.h > row_h {
-        let divider_h = DIVIDER_H * s;
-        let divider_y = row_h - divider_h;
-        // Inset by the content padding: the hairline separates bar from list
-        // without touching the border ring.
-        let (x0, x1) = panel.span(divider_y);
-        let mut divider = bg_prompt;
-        over_pm(&mut divider, colors.label_accent, DIVIDER_ALPHA);
-        let (dx0, dx1) = (x0 + p, x1.saturating_sub(p));
-        for by in divider_y..divider_y + divider_h {
-            if dx0 < dx1 {
-                set_span(buf, w, panel.y + by, dx0, dx1, divider);
-            }
-        }
+    body(buf, w, &bar, bg_prompt);
+    if let Some(list) = list {
+        body(buf, w, &list, bg_normal);
     }
 
     // Prompt / input row text.
-    let left = panel.x as f32;
-    let right = (panel.x + panel.w) as f32;
-    let baseline = row_baseline(font, panel.y);
+    let left = bar.x as f32;
+    let right = (bar.x + bar.w) as f32;
+    let baseline = row_baseline(font, bar.y);
     // The prompt label ("address") sits on a compact capsule, rounded on both
     // sides, so the bar background stays uniformly bg_prompt (identical to the
     // normal, prompt-less input bar).
@@ -471,8 +496,8 @@ pub fn draw(
             buf,
             w,
             h,
-            panel.x + p,
-            panel.y + rail_y,
+            bar.x + p,
+            bar.y + rail_y,
             rail_w,
             rail_h,
             colors.label_accent,
@@ -486,7 +511,7 @@ pub fn draw(
             baseline,
             prompt,
             colors.fg_prompt,
-            (panel.w - 2 * p) as f32,
+            (bar.w - 2 * p) as f32,
             subpixel,
         );
         // Eye-comfort: fixed on-grid gap between the label text and the first
@@ -530,18 +555,19 @@ pub fn draw(
 
     // Item rows (background already bg_normal from the panel pass; only the
     // selected row needs an override, clipped to the rounded outline).
+    let Some(list) = list else { return };
     for (i, row) in rows.iter().enumerate() {
-        let rel = row_h * (i as u32 + 1);
-        if rel >= panel.h {
+        let rel = row_h * i as u32;
+        if rel >= list.h {
             break;
         }
         if row.selected {
-            for yy in rel..(rel + row_h).min(panel.h) {
+            for yy in rel..(rel + row_h).min(list.h) {
                 // Inside the hairline: the ring frames the selection instead of
                 // being painted over by it.
-                let (x0, x1) = panel.span(yy);
+                let (x0, x1) = list.span(yy);
                 if x0 + 1 < x1 {
-                    set_span(buf, w, panel.y + yy, x0 + 1, x1 - 1, bg_sel);
+                    set_span(buf, w, list.y + yy, x0 + 1, x1 - 1, bg_sel);
                 }
             }
         }
@@ -556,10 +582,10 @@ pub fn draw(
             h,
             font,
             left + p as f32,
-            row_baseline(font, panel.y + rel),
+            row_baseline(font, list.y + rel),
             row.text,
             fg,
-            (panel.w - 2 * p) as f32,
+            (list.w - 2 * p) as f32,
             subpixel,
         );
     }
@@ -870,11 +896,21 @@ mod tests {
         premul(c)
     }
 
+    /// Panel height for `rows` result rows: bar, the separating gap, the list.
+    fn frame_h(row_h: u32, rows: u32, scale: u32) -> u32 {
+        row_h * (rows + 1) + SEPARATION * scale
+    }
+
+    /// Row `i` of the list, in panel coordinates.
+    fn row_y(row_h: u32, i: u32, scale: u32) -> u32 {
+        row_h + SEPARATION * scale + row_h * i
+    }
+
     /// Headless render check: draws a real frame (text incl. CJK) to a raw BGRA dump.
     #[test]
     fn renders_frame_with_cjk_text() {
         let font = MenuFont::load(None, 16.0).expect("system font available");
-        let (w, h) = (320u32, font.row_h * 4);
+        let (w, h) = (320u32, frame_h(font.row_h, 3, 1));
         let (bw, bh) = frame_size(w, h, 1);
         let mut buf = vec![0u8; (bw * bh * 4) as usize];
 
@@ -911,16 +947,19 @@ mod tests {
 
         let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
         // Selected row (rows[0]) has the selection background.
-        assert_eq!(px(w / 2, font.row_h + 1), &pm(colors.bg_sel));
+        assert_eq!(px(w / 2, row_y(font.row_h, 0, 1) + 1), &pm(colors.bg_sel));
         // Normal row (rows[1]) has the normal background.
-        assert_eq!(px(w / 2, font.row_h * 2 + 1), &pm(colors.bg_normal));
+        assert_eq!(
+            px(w / 2, row_y(font.row_h, 1, 1) + 1),
+            &pm(colors.bg_normal)
+        );
         // Prompt row has the prompt background.
         assert_eq!(px(w / 2, 1), &pm(colors.bg_prompt));
         // First text row must contain non-background pixels (glyph ink).
         let mut text_has_ink = false;
         'outer: for y in 2..24u32 {
             for x in PAD..200u32 {
-                if px(x, font.row_h + y) != pm(colors.bg_sel) {
+                if px(x, row_y(font.row_h, 0, 1) + y) != pm(colors.bg_sel) {
                     text_has_ink = true;
                     break 'outer;
                 }
@@ -981,7 +1020,7 @@ mod tests {
     #[test]
     fn glyph_cache_is_reused_across_frames() {
         let font = MenuFont::load(None, 16.0).expect("system font available");
-        let (w, h) = (320u32, font.row_h * 2);
+        let (w, h) = (320u32, frame_h(font.row_h, 1, 1));
         let (bw, bh) = frame_size(w, h, 1);
         let colors = Colors::default();
         let rows = [Row {
@@ -1094,8 +1133,11 @@ mod tests {
             assert_eq!(px(x, y)[..3], [0, 0, 0], "shadow only at ({x},{y})");
             assert!(px(x, y)[3] < colors.bg_normal[3] / 2, "{x},{y}");
         }
-        // The panel body is translucent glass, premultiplied.
-        assert_eq!(px(w / 2, h / 2), &pm(colors.bg_normal));
+        // The list card's body is translucent glass, premultiplied.
+        assert_eq!(
+            px(w / 2, row_y(font.row_h, 0, 1) + 2),
+            &pm(colors.bg_normal)
+        );
         assert!(
             px(6, 2)[0] < px(6, 2)[3],
             "a premultiplied body cannot be brighter than its alpha"
@@ -1147,7 +1189,7 @@ mod tests {
     /// body, so the glass edge reads as one line with the shadow under it.
     #[test]
     fn border_ring_is_one_pixel_wide() {
-        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let font = MenuFont::load(None, 20.0).expect("system font available");
         let (w, h) = (200u32, font.row_h * 3);
         let (bw, bh) = frame_size(w, h, 1);
         let mut buf = vec![0u8; (bw * bh * 4) as usize];
@@ -1168,14 +1210,14 @@ mod tests {
             Subpixel::Gray,
         );
         let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
-        let mid = h / 2;
-        assert_eq!(px(1, mid), &pm(colors.bg_normal), "body starts at x=1");
-        assert_ne!(px(0, mid), &pm(colors.bg_normal), "ring at x=0");
+        let mid = font.row_h / 2; // inside the bar card
+        assert_eq!(px(1, mid), &pm(colors.bg_prompt), "body starts at x=1");
+        assert_ne!(px(0, mid), &pm(colors.bg_prompt), "ring at x=0");
         // Lit along the top, dark along the bottom: that is what makes the edge
-        // read as a glass rim instead of a hard cut. Rows inside the corner
-        // radius, where x=0 is outside the body.
-        let top = CORNER_RADIUS + 4;
-        let bottom = h - CORNER_RADIUS - 1;
+        // read as a glass rim instead of a hard cut. Inside the bar card's flat
+        // band — above/below the corner radius the rim is off the body.
+        let top = CORNER_RADIUS;
+        let bottom = font.row_h - CORNER_RADIUS - 1;
         assert!(px(0, top)[0] > px(1, top)[0], "top rim is lit");
         assert!(px(0, bottom)[0] < px(1, bottom)[0], "bottom rim is dark");
     }
@@ -1241,7 +1283,7 @@ mod tests {
         );
 
         let font = MenuFont::load(None, 16.0).expect("system font available");
-        let (w, h) = (200u32, font.row_h * 2);
+        let (w, h) = (200u32, frame_h(font.row_h, 1, 1));
         let (bw, bh) = frame_size(w, h, 1);
         let mut buf = vec![0u8; (bw * bh * 4) as usize];
         draw(
@@ -1265,13 +1307,16 @@ mod tests {
         let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
         // Input bar row uses bg_prompt, the list row below it bg_normal.
         assert_eq!(px(w / 2, 2), &pm(def.bg_prompt));
-        assert_eq!(px(w / 2, font.row_h + 2), &pm(def.bg_normal));
+        assert_eq!(px(w / 2, row_y(font.row_h, 0, 1) + 2), &pm(def.bg_normal));
     }
 
+    /// The bar and the list are separate cards: the selection fills the list
+    /// card edge to edge inside its hairline, and the gap between the cards shows
+    /// the wallpaper (plus the bar's shadow), never either body colour.
     #[test]
-    fn selected_row_covers_full_width_and_list_has_divider() {
-        let font = MenuFont::load(None, 16.0).expect("system font available");
-        let (w, h) = (240u32, font.row_h * 2);
+    fn selected_row_fills_the_list_card_and_a_gap_separates_the_cards() {
+        let font = MenuFont::load(None, 20.0).expect("system font available");
+        let (w, h) = (240u32, frame_h(font.row_h, 1, 1));
         let (bw, bh) = frame_size(w, h, 1);
         let mut buf = vec![0u8; (bw * bh * 4) as usize];
         let colors = Colors::default();
@@ -1295,7 +1340,8 @@ mod tests {
         );
         let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
 
-        let selection_y = font.row_h + 1;
+        // Past the corner radius, where the card's row is a straight span.
+        let selection_y = row_y(font.row_h, 0, 1) + CORNER_RADIUS + 1;
         // Full width inside the hairline ring at x=0 / x=w-1.
         assert_eq!(px(1, selection_y), &pm(colors.bg_sel));
         assert_eq!(px(w - 2, selection_y), &pm(colors.bg_sel));
@@ -1310,14 +1356,12 @@ mod tests {
             "ring, not selection"
         );
 
-        // The divider is its own tone, between the bar and the accent.
-        let divider = px(w / 2, font.row_h - 1);
-        assert_ne!(divider, &pm(colors.bg_prompt));
-        assert_ne!(divider, &pm(colors.bg_normal));
-        for (c, value) in divider.iter().copied().take(3).enumerate() {
-            assert!(value >= pm(colors.bg_prompt)[c].min(colors.label_accent[c]));
-            assert!(value <= pm(colors.bg_prompt)[c].max(colors.label_accent[c]));
-        }
+        // Between the cards: neither body colour, and less opaque than a body —
+        // the wallpaper (plus the bar's shadow) shows through the gap.
+        let gap = px(w / 2, font.row_h + 2);
+        assert_ne!(gap, &pm(colors.bg_prompt));
+        assert_ne!(gap, &pm(colors.bg_normal));
+        assert!(gap[3] < colors.bg_normal[3], "gap is not a body: {gap:?}");
     }
 
     #[test]
@@ -1544,7 +1588,7 @@ mod tests {
     #[test]
     fn hidpi_scale_doubles_the_buffer_geometry() {
         let font = MenuFont::load(None, 32.0).expect("system font available");
-        let (w, h) = (480u32, font.row_h * 2);
+        let (w, h) = (480u32, frame_h(font.row_h, 2, 2));
         let (bw, bh) = frame_size(w, h, 2);
         let mut buf = vec![0u8; (bw * bh * 4) as usize];
         let def = Colors::default();
@@ -1587,13 +1631,13 @@ mod tests {
             "past the scaled rail"
         );
 
-        let selection_y = font.row_h + 1;
+        let selection_y = row_y(font.row_h, 0, 2) + font.row_h / 2 + 1;
         assert_eq!(px(1, selection_y), &pm(def.bg_sel));
         assert_eq!(px(w - 2, selection_y), &pm(def.bg_sel));
         assert_ne!(
-            px(w / 2, font.row_h - 1),
+            px(w / 2, font.row_h + 2 * SEPARATION),
             &pm(def.bg_prompt),
-            "logical divider scales to physical pixels"
+            "the logical gap scales to physical pixels"
         );
 
         // The shadow margin scales too: 2 * 24 logical px each side.

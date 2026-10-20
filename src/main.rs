@@ -450,8 +450,11 @@ fn max_rows(output_h: u32, row_h: u32, gap: u32, scale: u32) -> usize {
     let s = scale.max(1);
     let budget = output_h
         .saturating_mul(s)
-        .saturating_sub(gap.saturating_mul(2).saturating_mul(s));
-    (budget / row_h.max(1)).saturating_sub(1) as usize
+        .saturating_sub(gap.saturating_mul(2).saturating_mul(s))
+        // The bar, plus the gap that separates it from the list.
+        .saturating_sub(row_h)
+        .saturating_sub(render::SEPARATION * s);
+    (budget / row_h.max(1)) as usize
 }
 
 /// Default panel width for an output: a fixed fraction of it, clamped so the bar
@@ -975,7 +978,14 @@ impl App {
         // `row_h` already includes the density, so heights here are buffer
         // pixels; the layer surface itself is sized in logical pixels.
         let row_h = font.row_h;
-        let target = row_h * (visible as u32 + 1);
+        // Bar, `SEPARATION` px of air, then the list — the gap only exists while
+        // the list does, so the collapsed bar stays one row tall.
+        let target = row_h * (visible as u32 + 1)
+            + if visible > 0 {
+                render::SEPARATION * scale
+            } else {
+                0
+            };
         // Smooth every height change: the bar expanding into a list, the list
         // growing/shrinking as the query narrows, and the collapse back to the
         // bar. Each new target restarts the ease from what is on screen now.
@@ -1050,9 +1060,14 @@ impl App {
         );
 
         // Scroll position indicator: only while the list overflows the viewport.
-        if let Some((ty, th)) =
-            render::scroll_thumb(row_h, h.saturating_sub(row_h), visible, total, self.top)
-        {
+        let sep = render::SEPARATION * scale;
+        if let Some((ty, th)) = render::scroll_thumb(
+            row_h + sep,
+            h.saturating_sub(row_h + sep),
+            visible,
+            total,
+            self.top,
+        ) {
             let tw = 3 * scale;
             let tx = bw - mo - (pad * scale + tw) / 2;
             render::rect(

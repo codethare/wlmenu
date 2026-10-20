@@ -21,7 +21,8 @@ the whole UI is drawn by `ab_glyph`.
   backspace, `Ctrl-j`/`Ctrl-m` accept, `Ctrl-u` clears the line, `Ctrl-w` kills
   the last word, `Shift-Return` submits exactly what was typed, and
   `Ctrl-Return` multi-selects (prints each pick, keeps running)
-- Spotlight-style UI: rounded corners; launch shows only the input bar in the
+- Spotlight-style UI: rounded corners; the input bar and the result list are two
+  separate cards with an 8 px gap between them; launch shows only the input bar in the
   upper-center of the screen, results appear as you type, and the menu
   collapses back to the bar when the query is cleared. Height changes ease over
   120 ms instead of jumping. With `-p` the list is shown from the start and
