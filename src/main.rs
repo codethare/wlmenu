@@ -49,17 +49,25 @@ use wayland_client::{
     protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface},
 };
 
+/// Width of the first commit, before `surface_enter` reports the output; the
+/// panel then resizes to `auto_width` of that output (unless `-W` pins it).
 const DEFAULT_WIDTH: u32 = 640;
-/// Default body size in px (15 pt at 96 dpi). MacOS chrome sits at 13-15 pt, and
-/// 16 px read small next to it. The proportions follow from it: `row_h_for`
-/// keeps 1.5x line height (30 px) and `PAD` is 0.8 em, as in a mac menu.
+/// Default panel width as a percentage of the output width, clamped. Spotlight is
+/// a fixed size on macOS (it cannot be resized), so these are a product choice
+/// modelled on its footprint at a common Mac resolution, not a spec quote.
+const WIDTH_PCT: u32 = 45;
+const AUTO_WIDTH_MIN: u32 = 480;
+const AUTO_WIDTH_MAX: u32 = 960;
+/// Default body size in px (15 pt at 96 dpi): a fraction of the panel width, so
+/// the text keeps its size relative to the screen. 1/32 of 640 px is 20 px.
+const FONT_PX_DIV: f32 = 32.0;
+const FONT_PX_MIN: f32 = 14.0;
+const FONT_PX_MAX: f32 = 30.0;
 const FONT_SIZE: f32 = 20.0;
 /// Text antialiasing: LCD subpixel (`Rgb`) is noticeably sharper on 1× displays.
 /// Switch to `Bgr` for BGR-stripe panels (text would fringe on the wrong side)
 /// or `Gray` for neutral rendering without colour fringing.
 const TEXT_AA: render::Subpixel = render::Subpixel::Rgb;
-/// Panel content inset: must be >= corner radius so text never grazes the curve.
-const PAD: u32 = 16;
 /// Away-from-edge float for the upper-center panel (bottom mode floats too).
 const TOP_MARGIN: i32 = 32;
 // The panel sits inside the shadow margin, so the surface margin is the visible
@@ -79,7 +87,9 @@ const BLINK_PERIOD: Duration = Duration::from_millis(500);
 const FRAME: Duration = Duration::from_millis(16);
 struct Opts {
     prompt: String,
-    width: u32,
+    /// `-W`: absolute width. `None` means "a fraction of the output width"
+    /// (`auto_width`), resolved once the output size is known.
+    width: Option<u32>,
     lines: usize,
     ci: bool,
     font: Option<String>,
@@ -109,7 +119,7 @@ fn usage() -> ! {
 fn parse_opts_from(args: impl Iterator<Item = String>) -> Opts {
     let mut o = Opts {
         prompt: String::new(),
-        width: DEFAULT_WIDTH,
+        width: None,
         lines: 0,
         ci: false,
         font: None,
@@ -147,7 +157,7 @@ fn parse_opts_from(args: impl Iterator<Item = String>) -> Opts {
                 if !valid_width(n) {
                     usage();
                 }
-                o.width = n;
+                o.width = Some(n);
             }
             "-f" => o.font = Some(args.next().unwrap_or_else(|| usage())),
             "-o" => o.output = Some(args.next().unwrap_or_else(|| usage())),
@@ -213,8 +223,11 @@ fn main() {
     // frame (`App::ensure_font`). So the panel commits at its final row height
     // without waiting for any font file: `row_h_for` needs only the size, which
     // the `-f` spec already fixes.
-    let bar_h = font::row_h_for(font::spec_size(opts.font.as_deref(), FONT_SIZE));
-    let font_thread = font::spawn_load(opts.font.clone(), FONT_SIZE);
+    // The body size this run starts at: `-f`'s own size token, else the default.
+    // The output width can raise it once `surface_enter` knows the screen.
+    let start_px = font::spec_size(opts.font.as_deref(), FONT_SIZE);
+    let bar_h = font::row_h_for(start_px);
+    let font_thread = font::spawn_load(opts.font.clone(), start_px);
 
     let conn = Connection::connect_to_env().unwrap_or_else(|e| {
         eprintln!("wlmenu: cannot connect to Wayland: {e}");
@@ -240,11 +253,10 @@ fn main() {
     let output_state = OutputState::new(&globals, &qh);
     let height = bar_h * (row_capacity(opts.lines) as u32 + 1);
     let shadow = 2 * render::SHADOW;
-    let pool = SlotPool::new(
-        ((opts.width + shadow) * (height + shadow) * 4) as usize,
-        &shm,
-    )
-    .expect("failed to allocate shm pool");
+    // Hint for the widest the panel can become, not just the first commit's width.
+    let hint_w = opts.width.unwrap_or(AUTO_WIDTH_MAX);
+    let pool = SlotPool::new(((hint_w + shadow) * (height + shadow) * 4) as usize, &shm)
+        .expect("failed to allocate shm pool");
     let item_count = items.len();
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -262,10 +274,12 @@ fn main() {
         menu: MenuState::new(item_count),
         top: 0,
         font: None,
-        pending: Some((FONT_SIZE, font_thread)),
+        pending: Some((start_px, font_thread)),
         font_spec: opts.font.clone(),
         prompt: opts.prompt.clone(),
-        width: opts.width,
+        width: opts.width.unwrap_or(DEFAULT_WIDTH),
+        width_explicit: opts.width,
+        font_px: start_px,
         scale: 1,
         lines: opts.lines,
         ci: opts.ci,
@@ -438,6 +452,24 @@ fn max_rows(output_h: u32, row_h: u32, gap: u32, scale: u32) -> usize {
         .saturating_mul(s)
         .saturating_sub(gap.saturating_mul(2).saturating_mul(s));
     (budget / row_h.max(1)).saturating_sub(1) as usize
+}
+
+/// Default panel width for an output: a fixed fraction of it, clamped so the bar
+/// stays a bar on a small screen and does not become a page on a large one.
+fn auto_width(output_w: u32) -> u32 {
+    (output_w.saturating_mul(WIDTH_PCT) / 100).clamp(AUTO_WIDTH_MIN, AUTO_WIDTH_MAX)
+}
+
+/// Default text size for a panel width, so bar height and row height scale with
+/// the screen instead of staying fixed while the panel grows around them.
+fn auto_font(width: u32) -> f32 {
+    (width as f32 / FONT_PX_DIV).clamp(FONT_PX_MIN, FONT_PX_MAX)
+}
+
+/// Content inset: 0.8 em, as in a mac menu, and never less than the corner
+/// radius so text cannot graze the curve.
+fn pad_for(font_px: f32) -> u32 {
+    ((font_px * 0.8).round() as u32).max(render::CORNER_RADIUS)
 }
 
 /// Subpixel AA pays off on 1× outputs; on HiDPI the pixel grid is already dense,
@@ -657,7 +689,12 @@ struct App {
     /// The `-f` spec, kept so the font can be re-derived at a new scale.
     font_spec: Option<String>,
     prompt: String,
+    /// Effective panel width: `-W`, or the output-derived default once known.
     width: u32,
+    /// `-W` given: an absolute width the output size cannot override.
+    width_explicit: Option<u32>,
+    /// Logical default body size in effect (screen-derived unless `-f` pins it).
+    font_px: f32,
     /// Output scale (HiDPI density); 1 until `surface_enter` reports it.
     scale: u32,
     lines: usize,
@@ -710,10 +747,9 @@ impl App {
         // is the same value startup used to size the first commit.
         let row_h = match &self.font {
             Some(font) => font.row_h,
-            None => {
-                let size = font::spec_size(self.font_spec.as_deref(), FONT_SIZE);
-                font::row_h_for(size * self.scale as f32)
-            }
+            // Before the font is joined the provisional height is the same value
+            // startup used to size the first commit.
+            None => font::row_h_for(self.font_px * self.scale as f32),
         };
         let gap = if self.bottom {
             render::SHADOW
@@ -782,12 +818,35 @@ impl App {
             return;
         }
         self.scale = scale;
-        let size = FONT_SIZE * scale as f32;
-        // Keep a load that already matches; replace anything else (dropping the
-        // handle detaches that thread rather than waiting for it).
-        if !matches!(&self.pending, Some((pending, _)) if *pending == size) {
-            self.pending = Some((size, font::spawn_load(self.font_spec.clone(), size)));
+        self.derive_font();
+    }
+
+    /// Adopt the output's size: the panel width and, unless `-W`/`-f` pinned them,
+    /// the text size follow the screen.
+    fn apply_output_size(&mut self, output_w: u32) {
+        if self.width_explicit.is_none() {
+            self.width = auto_width(output_w);
         }
+        let px = font::spec_size(self.font_spec.as_deref(), auto_font(self.width));
+        if px != self.font_px {
+            self.font_px = px;
+            self.derive_font();
+        }
+    }
+
+    /// Load the font for the current density and body size, unless a load with
+    /// exactly that size is already in flight or in hand.
+    fn derive_font(&mut self) {
+        let size = self.font_px * self.scale as f32;
+        let loaded = self
+            .font
+            .as_ref()
+            .is_some_and(|f| (f.size - size).abs() < 0.01);
+        if loaded || matches!(&self.pending, Some((pending, _)) if *pending == size) {
+            return;
+        }
+        // Dropping the old handle detaches that thread rather than waiting for it.
+        self.pending = Some((size, font::spawn_load(self.font_spec.clone(), size)));
         self.request_draw();
     }
 
@@ -952,6 +1011,8 @@ impl App {
                 return;
             }
         };
+        // Content inset follows the text (0.8 em), from the size actually loaded.
+        let pad = pad_for(font.size / scale as f32);
         render::draw(
             canvas,
             bw,
@@ -961,7 +1022,7 @@ impl App {
             &self.menu.query,
             self.password,
             &rows,
-            PAD,
+            pad,
             &self.colors,
             scale,
             self.blink,
@@ -972,9 +1033,8 @@ impl App {
         if let Some((ty, th)) =
             render::scroll_thumb(row_h, h.saturating_sub(row_h), visible, total, self.top)
         {
-            let pad = PAD * scale;
             let tw = 3 * scale;
-            let tx = bw - mo - (pad + tw) / 2;
+            let tx = bw - mo - (pad * scale + tw) / 2;
             render::rect(
                 canvas,
                 bw,
@@ -1057,6 +1117,9 @@ impl CompositorHandler for App {
             if self.output_w != Some(w) || self.output_h != Some(h) {
                 self.output_w = Some(w); // center the panel on this output
                 self.output_h = Some(h); // and keep the list inside it
+                // Density first: the default size is derived at the new scale.
+                self.apply_scale(info.scale_factor);
+                self.apply_output_size(w);
                 self.request_draw();
             }
         }
@@ -1300,6 +1363,29 @@ mod tests {
         );
         // `-b` sits SHADOW from the bottom edge: symmetric around that gap.
         assert_eq!(max_rows(1080, row, render::SHADOW, 1), 33);
+    }
+
+    /// The panel's default size follows the output: width a fixed fraction of it,
+    /// text a fixed fraction of the width, so the bar keeps its proportions from a
+    /// 1280-wide laptop to a 4K desktop rather than growing into a page.
+    #[test]
+    fn default_size_follows_the_output() {
+        // Width is 45% of the output, clamped at both ends.
+        assert_eq!(auto_width(1280), 576);
+        assert_eq!(auto_width(1440), 648);
+        assert_eq!(auto_width(1920), 864);
+        assert_eq!(auto_width(2560), 960, "clamped on a wide screen");
+        assert_eq!(auto_width(1024), 480, "clamped on a small one");
+        // Text is 1/32 of the panel width: 640 -> 20 px, as before.
+        assert_eq!(auto_font(640), 20.0);
+        assert_eq!(auto_font(864), 27.0);
+        assert_eq!(auto_font(480), 15.0);
+        assert_eq!(auto_font(4000), FONT_PX_MAX);
+        assert_eq!(auto_font(100), FONT_PX_MIN);
+        // The inset follows the text but never undercuts the corner radius.
+        assert_eq!(pad_for(20.0), 16);
+        assert_eq!(pad_for(27.0), 22);
+        assert_eq!(pad_for(10.0), render::CORNER_RADIUS);
     }
 
     #[test]

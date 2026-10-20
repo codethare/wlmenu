@@ -60,7 +60,9 @@ printf 'alacritty\nfirefox\n' | wlmenu -i -p 'run: '
 ```
 
 Options (wmenu-compatible subset): `-b` (menu at screen bottom), `-P` (mask typed
-input as asterisks), `-i` (case-insensitive), `-l lines` (visible rows), `-W width`,
+input as asterisks), `-i` (case-insensitive), `-l lines` (visible rows), `-W width`
+(default: 45% of the output width, clamped to 480-960 px, with the text size
+following it),
 `-p prompt`, `-o output` (show on the named output), `-f font.ttf|"FAMILY [style] [pt|Npx]"` (bare size is points, `Npx` is
 pixels — wmenu/Pango convention), `-v` (print version), `--run`, `-h`.
 

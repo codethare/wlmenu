@@ -48,7 +48,10 @@ item rows; the list scrolls beyond that.  Without it at most 64 rows are
 shown.
 .TP
 .B \-W " width"
-Panel width in logical pixels (default 640).
+Panel width in logical pixels.  Without
+.B \-W
+the width is 45% of the output width, clamped to 480\-960 px, and the text size
+follows it (1/32 of the width, 14\-30 px).
 .TP
 .B \-p " prompt"
 Prompt label drawn at the left of the input bar (for example

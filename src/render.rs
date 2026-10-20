@@ -29,11 +29,9 @@ const _: () = assert!(SHADOW >= SHADOW_WIDE.0 + SHADOW_WIDE.2);
 const BORDER_LIGHT_ALPHA: u32 = 34;
 const BORDER_DARK_ALPHA: u32 = 60;
 
-// Eye-comfort rules, checked at compile time (clippy: assertions on constants
-// belong here): the content inset must clear the corner radius so text never
-// grazes the curve, and the panel must float off the screen edge rather than
-// hug it.
-const _: () = assert!(crate::PAD >= CORNER_RADIUS);
+// Eye-comfort rules: the content inset must clear the corner radius so text never
+// grazes the curve — `main::pad_for` floors it at `CORNER_RADIUS` — and the panel
+// must float off the screen edge rather than hug it, which is compile-time.
 const _: () = assert!(crate::TOP_MARGIN >= 32);
 
 /// Fully transparent pixel: what the shadow margin holds every frame.
@@ -851,6 +849,10 @@ mod tests {
     use super::*;
     use crate::font::MenuFont;
 
+    /// Content inset the tests render at — the app derives it from the font size
+    /// (`pad_for`), this is the value at the 20 px default.
+    const PAD: u32 = 16;
+
     /// Buffer size for a panel of `w`×`h` buffer px at `scale`: the panel plus
     /// its shadow margin on both sides.
     fn frame_size(w: u32, h: u32, scale: u32) -> (u32, u32) {
@@ -900,7 +902,7 @@ mod tests {
             "fir",
             false,
             &rows,
-            crate::PAD,
+            PAD,
             &colors,
             1,
             true,
@@ -917,7 +919,7 @@ mod tests {
         // First text row must contain non-background pixels (glyph ink).
         let mut text_has_ink = false;
         'outer: for y in 2..24u32 {
-            for x in crate::PAD..200u32 {
+            for x in PAD..200u32 {
                 if px(x, font.row_h + y) != pm(colors.bg_sel) {
                     text_has_ink = true;
                     break 'outer;
@@ -945,7 +947,7 @@ mod tests {
                 "firim",
                 false,
                 &[],
-                crate::PAD,
+                PAD,
                 &Colors::default(),
                 1,
                 true,
@@ -996,7 +998,7 @@ mod tests {
             "fir",
             false,
             &rows,
-            crate::PAD,
+            PAD,
             &colors,
             1,
             true,
@@ -1015,7 +1017,7 @@ mod tests {
             "fir",
             false,
             &rows,
-            crate::PAD,
+            PAD,
             &colors,
             1,
             true,
@@ -1041,7 +1043,7 @@ mod tests {
             "火狐",
             false,
             &[],
-            crate::PAD,
+            PAD,
             &Colors::default(),
             1,
             true,
@@ -1078,7 +1080,7 @@ mod tests {
             "fir",
             false,
             &[],
-            crate::PAD,
+            PAD,
             &colors,
             1,
             true,
@@ -1121,7 +1123,7 @@ mod tests {
             "",
             false,
             &[],
-            crate::PAD,
+            PAD,
             &colors,
             1,
             false,
@@ -1159,7 +1161,7 @@ mod tests {
             "",
             false,
             &[],
-            crate::PAD,
+            PAD,
             &colors,
             1,
             false,
@@ -1196,7 +1198,7 @@ mod tests {
             "",
             false,
             &[],
-            crate::PAD,
+            PAD,
             &colors,
             1,
             false,
@@ -1254,7 +1256,7 @@ mod tests {
                 text: "app",
                 selected: false,
             }],
-            crate::PAD,
+            PAD,
             &def,
             1,
             true,
@@ -1285,7 +1287,7 @@ mod tests {
                 text: "",
                 selected: true,
             }],
-            crate::PAD,
+            PAD,
             &colors,
             1,
             false,
@@ -1339,7 +1341,7 @@ mod tests {
             "",
             false,
             &[],
-            crate::PAD,
+            PAD,
             &def,
             1,
             true,
@@ -1354,32 +1356,28 @@ mod tests {
         // A 4px rail sits flush on the bar's left padding; everything else —
         // just past the rail, between rail and label text, and the far right —
         // is bg_prompt, so the bar reads like the normal, prompt-less input bar.
-        assert_eq!(px(crate::PAD, mid), &def.label_accent, "rail left edge");
+        assert_eq!(px(PAD, mid), &def.label_accent, "rail left edge");
         assert_eq!(
-            px(crate::PAD + LABEL_RAIL_W - 1, mid),
+            px(PAD + LABEL_RAIL_W - 1, mid),
             &def.label_accent,
             "rail right edge"
         );
         assert_eq!(
-            px(crate::PAD + LABEL_RAIL_W, mid),
+            px(PAD + LABEL_RAIL_W, mid),
             &pm(def.bg_prompt),
             "just past the rail"
         );
         assert_eq!(
-            px(crate::PAD + 8, mid),
+            px(PAD + 8, mid),
             &pm(def.bg_prompt),
             "between rail and label text"
         );
         assert_eq!(px(w - 10, mid), &pm(def.bg_prompt));
         // Rail is vertically centered at the same height the capsule had.
-        assert_eq!(px(crate::PAD, rail_y), &def.label_accent, "rail top");
+        assert_eq!(px(PAD, rail_y), &def.label_accent, "rail top");
+        assert_eq!(px(PAD, rail_y - 1), &pm(def.bg_prompt), "above the rail");
         assert_eq!(
-            px(crate::PAD, rail_y - 1),
-            &pm(def.bg_prompt),
-            "above the rail"
-        );
-        assert_eq!(
-            px(crate::PAD, rail_y + rail_h),
+            px(PAD, rail_y + rail_h),
             &pm(def.bg_prompt),
             "below the rail"
         );
@@ -1395,16 +1393,13 @@ mod tests {
             "x",
             false,
             &[],
-            crate::PAD,
+            PAD,
             &def,
             1,
             true,
             Subpixel::Gray,
         );
-        assert_eq!(
-            &buf2[idx(bw, 1, crate::PAD, mid)..][..4],
-            &pm(def.bg_prompt)
-        );
+        assert_eq!(&buf2[idx(bw, 1, PAD, mid)..][..4], &pm(def.bg_prompt));
     }
 
     /// Caret hidden while blinked off: no solid fg_prompt column.
@@ -1424,7 +1419,7 @@ mod tests {
             "fir",
             false,
             &[],
-            crate::PAD,
+            PAD,
             &colors,
             1,
             false,
@@ -1446,7 +1441,7 @@ mod tests {
         let (w, h) = (400u32, font.row_h);
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let colors = Colors::default();
-        let (start, max_w) = (crate::PAD as f32, 60.0f32);
+        let (start, max_w) = (PAD as f32, 60.0f32);
         let limit = (start + max_w).ceil() as u32;
         let long = "W".repeat(200);
 
@@ -1565,7 +1560,7 @@ mod tests {
                 text: "",
                 selected: true,
             }],
-            crate::PAD,
+            PAD,
             &def,
             2,
             true,
@@ -1575,7 +1570,7 @@ mod tests {
         let mid = font.row_h / 2;
 
         // Padding 16 -> 32, rail width 4 -> 8.
-        let rail_x = crate::PAD * 2;
+        let rail_x = PAD * 2;
         assert_eq!(
             px(rail_x, mid),
             &def.label_accent,
@@ -1675,7 +1670,7 @@ mod tests {
                 "fir",
                 false,
                 &[],
-                crate::PAD,
+                PAD,
                 &colors,
                 1,
                 true,
@@ -1700,7 +1695,7 @@ mod tests {
             }
             let x = caret_x.expect("caret must be drawn after the query text");
             // Caret sits just past the text (starts at the panel padding).
-            assert!(x > crate::PAD + 4, "caret at x={x} should follow the text");
+            assert!(x > PAD + 4, "caret at x={x} should follow the text");
             // Vertical span == the line block centered in the (taller) row.
             let line_h = font.line_h.ceil() as u32;
             let top_expected = (font.row_h - line_h) / 2;
@@ -1747,7 +1742,7 @@ mod tests {
                     "fir",
                     false,
                     &[],
-                    crate::PAD,
+                    PAD,
                     &colors,
                     1,
                     true,
@@ -1770,7 +1765,7 @@ mod tests {
             // the pill's two horizontal paddings and the inter-element gap; without
             // one it starts straight at the padding. f32 sums can round the
             // measured delta up by one pixel.
-            let advance = measure(&font, "run:", (w - 2 * crate::PAD) as f32) as u32;
+            let advance = measure(&font, "run:", (w - 2 * PAD) as f32) as u32;
             // Rail (4px) + label gap (8px) + inter-element gap (8px).
             let separators = (LABEL_RAIL_W as f32 + 2.0 * PROMPT_GAP) as u32;
             let delta = caret_x("run:") - caret_x("") - advance;
