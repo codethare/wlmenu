@@ -24,7 +24,9 @@ the whole UI is drawn by `ab_glyph`.
 - Spotlight-style UI: rounded corners; launch shows only the input bar in the
   upper-center of the screen, results appear as you type, and the menu
   collapses back to the bar when the query is cleared. Height changes ease over
-  120 ms instead of jumping
+  120 ms instead of jumping. With `-p` the list is shown from the start and
+  Enter takes the highlighted row, so `printf 'no\nyes' | wlmenu -p 'Suspend?'`
+  is a usable confirm dialog
 - text is antialiased with LCD subpixel filtering on 1× outputs (sharper on a
   normal-DPI screen) and neutral grayscale AA on HiDPI, where subpixel only
   costs time and adds colour fringes

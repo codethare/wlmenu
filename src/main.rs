@@ -271,7 +271,7 @@ fn main() {
         keyboard: None,
         items,
         feed,
-        menu: MenuState::new(item_count),
+        menu: MenuState::new(item_count).with_prompt(!opts.prompt.is_empty()),
         top: 0,
         font: None,
         pending: Some((start_px, font_thread)),
@@ -472,6 +472,12 @@ fn pad_for(font_px: f32) -> u32 {
     ((font_px * 0.8).round() as u32).max(render::CORNER_RADIUS)
 }
 
+/// Spotlight collapse: the list stays hidden until the query has content — unless
+/// a `-p` prompt makes this a confirm-style menu, whose answers must be visible.
+fn list_hidden(query: &str, prompt: &str) -> bool {
+    query.is_empty() && prompt.is_empty()
+}
+
 /// Subpixel AA pays off on 1× outputs; on HiDPI the pixel grid is already dense,
 /// so it only adds colour fringing and ~55% more paint time there.
 fn text_aa(scale: u32) -> render::Subpixel {
@@ -504,6 +510,10 @@ struct MenuState {
     done: Option<Done>,
     /// Values picked by Ctrl-Return while the menu keeps running (multi-select).
     picked: Vec<String>,
+    /// The list is on screen from the start: a `-p` prompt makes this a question
+    /// with ready-made answers rather than a Spotlight launcher, so Enter may take
+    /// the highlighted row before anything is typed.
+    prompt: bool,
 }
 
 impl MenuState {
@@ -514,7 +524,14 @@ impl MenuState {
             sel: 0,
             done: None,
             picked: Vec::new(),
+            prompt: false,
         }
+    }
+
+    /// `-p` was given (see [`MenuState::prompt`]).
+    fn with_prompt(mut self, prompt: bool) -> Self {
+        self.prompt = prompt;
+        self
     }
 
     fn refilter(&mut self, items: &[items::Item], ci: bool) {
@@ -532,14 +549,15 @@ impl MenuState {
         }
     }
 
-    /// Plain Return: select the highlighted item, or cancel on an empty query
-    /// (with the list hidden there is nothing visible to pick, so Enter
-    /// cancels instead of selecting blind).
+    /// Plain Return: the highlighted row when the list is on screen, else cancel
+    /// on an empty query (hidden list: nothing is visible to pick) or echo the
+    /// typed line when nothing matches (dmenu contract).
     fn enter(&mut self, items: &[items::Item]) {
-        self.done = if self.query.is_empty() {
-            Some(Done::Cancel)
-        } else {
-            Some(Done::Select(self.pick_value(items)))
+        let pickable = !self.query.is_empty() || self.prompt;
+        self.done = match self.matches.get(self.sel) {
+            Some(_) if pickable => Some(Done::Select(self.pick_value(items))),
+            _ if self.query.is_empty() => Some(Done::Cancel),
+            _ => Some(Done::Select(self.query.clone())),
         };
     }
 
@@ -922,8 +940,10 @@ impl App {
         let font = self.font.as_ref().expect("font joined before use");
 
         // Spotlight: no list until the query has content; collapse back to the
-        // single input bar when the query is cleared.
-        let visible = if self.menu.query.is_empty() {
+        // single input bar when the query is cleared. A `-p` prompt is a question
+        // with ready-made answers (the dmenu confirm idiom), so its list is shown
+        // from the start instead.
+        let visible = if list_hidden(&self.menu.query, &self.prompt) {
             0
         } else {
             self.visible()
@@ -1492,6 +1512,32 @@ mod tests {
     fn enter_with_empty_query_cancels() {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
+        key(&mut m, &items, Keysym::Return, None);
+        assert_eq!(m.done, Some(Done::Cancel));
+    }
+
+    /// `-p` makes the menu a question with ready-made answers: the list is on
+    /// screen from the start and Enter takes the highlighted one, so
+    /// `printf "no\nyes" | wlmenu -p "System Suspend?"` works without typing.
+    #[test]
+    fn prompt_menus_show_and_take_their_answers_at_launch() {
+        assert!(list_hidden("", ""), "launcher stays collapsed");
+        assert!(!list_hidden("", "System Suspend?"), "prompt shows the list");
+        assert!(!list_hidden("y", ""), "typing shows the list");
+
+        let items = sample_items();
+        let mut m = MenuState::new(items.len()).with_prompt(true);
+        key(&mut m, &items, Keysym::Return, None);
+        assert_eq!(m.done, Some(Done::Select("firefox".into())));
+    }
+
+    /// The same keystroke on a launcher (no prompt) still cancels: its list is
+    /// hidden, so there is nothing visible to pick blind.
+    #[test]
+    fn launcher_enter_on_empty_query_still_cancels() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        assert!(!m.prompt);
         key(&mut m, &items, Keysym::Return, None);
         assert_eq!(m.done, Some(Done::Cancel));
     }

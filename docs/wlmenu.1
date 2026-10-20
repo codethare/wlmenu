@@ -55,7 +55,11 @@ follows it (1/32 of the width, 14\-30 px).
 .TP
 .B \-p " prompt"
 Prompt label drawn at the left of the input bar (for example
-.RB \(aq "run: " \(aq ).
+.RB \(aq "run: " \(aq ).  Giving a prompt also keeps the result list on screen
+before anything is typed, so Enter takes the highlighted row: that is what
+makes a confirm menu such as
+.B "printf 'no\\nyes' | wlmenu -p 'Suspend?'"
+work without typing.
 .TP
 .B \-P
 Mask the typed input with asterisks (password mode).  Filtering still sees
