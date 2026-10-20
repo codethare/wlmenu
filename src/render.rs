@@ -47,7 +47,7 @@ const PILL_VPAD: u32 = 2;
 const LABEL_RAIL_W: u32 = 4;
 /// Gap between the input bar and the result list (logical px): they are two
 /// cards, the way Spotlight floats its field above the results.
-pub const SEPARATION: u32 = 8;
+pub const SEPARATION: u32 = 12;
 
 /// Translucent glass body: the alpha is what the compositor blends with the
 /// wallpaper, so the buffer is premultiplied (`draw` does that).
