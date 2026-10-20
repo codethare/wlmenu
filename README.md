@@ -28,6 +28,10 @@ the whole UI is drawn by `ab_glyph`.
   120 ms instead of jumping. With `-p` the list is shown from the start and
   Enter takes the highlighted row, so `printf 'no\nyes' | wlmenu -p 'Suspend?'`
   is a usable confirm dialog
+- the panel is translucent glass: an antialiased rounded edge, a hairline along
+  it, and a two-layer drop shadow that wraps the rounded corners instead of being
+  cut off by them. There is no background blur (that needs a compositor
+  protocol), so a busy wallpaper is best handled with a higher alpha
 - text is antialiased with LCD subpixel filtering on 1× outputs (sharper on a
   normal-DPI screen) and neutral grayscale AA on HiDPI, where subpixel only
   costs time and adds colour fringes
