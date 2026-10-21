@@ -8,6 +8,8 @@ Enter to select, Escape to cancel. It renders text entirely in software
 (wl_shm + its own rasterizer), so there are no cairo/pango dependencies —
 the whole UI is drawn by `ab_glyph`.
 
+![wlmenu over a desktop wallpaper](docs/screenshot.png)
+
 ## Features
 
 - wmenu/dmenu-style filtering: every space-separated query token must be a
@@ -30,7 +32,8 @@ the whole UI is drawn by `ab_glyph`.
   is a usable confirm dialog
 - the panel is translucent glass: an antialiased rounded edge, a hairline along
   it, and a two-layer drop shadow that wraps the rounded corners instead of being
-  cut off by them. There is no background blur (that needs a compositor
+  cut off by them — the same chrome numbers as [plush](https://github.com/codethare/plush).
+  There is no background blur (that needs a compositor
   protocol), so a busy wallpaper is best handled with a higher alpha
 - text is antialiased with LCD subpixel filtering on 1× outputs (sharper on a
   normal-DPI screen) and neutral grayscale AA on HiDPI, where subpixel only

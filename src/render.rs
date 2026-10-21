@@ -14,20 +14,50 @@ pub const CORNER_RADIUS: u32 = 12;
 
 /// Space reserved around the panel for its drop shadow (logical px). The buffer
 /// and the layer surface grow by it; the panel keeps its size and position.
-pub const SHADOW: u32 = 24;
+pub const SHADOW: u32 = 20;
 
 /// Shadow layers as (blur radius, alpha at the panel edge, vertical offset),
 /// logical px and 0-255. A tight contact shadow under a wide ambient one; the
 /// offset is positive because the light comes from above.
-const SHADOW_TIGHT: (u32, u32, u32) = (7, 170, 2);
-const SHADOW_WIDE: (u32, u32, u32) = (17, 130, 6);
+const SHADOW_TIGHT: (u32, u32, u32) = (6, 155, 1);
+const SHADOW_WIDE: (u32, u32, u32) = (13, 115, 4);
 // The margin must fit the widest layer, or its falloff is cut off at the buffer edge.
 const _: () = assert!(SHADOW >= SHADOW_WIDE.0 + SHADOW_WIDE.2);
 
 /// Hairline on the panel's outermost pixel — the seam between the translucent
-/// body and the shadow. Lit along the top, dark underneath, like window chrome.
+/// body and the shadow. Its lit ink is solid along the top edge and gone by the
+/// lower third; its dark underside starts past the middle and is whole at the
+/// bottom. Between them the edge carries a little of both, which is what keeps it
+/// visible against the wallpaper without drawing a line around the panel.
+/// (Same profiles as plush, so both panels share one chrome.)
 const BORDER_LIGHT_ALPHA: u32 = 34;
 const BORDER_DARK_ALPHA: u32 = 60;
+const BORDER_LIT: [(f32, f32); 5] = [
+    (0.0, 1.0),
+    (0.28, 0.62),
+    (0.55, 0.21),
+    (0.85, 0.0),
+    (1.0, 0.0),
+];
+const BORDER_DARK: [(f32, f32); 4] = [(0.0, 0.0), (0.5, 0.1), (0.82, 0.63), (1.0, 1.0)];
+
+/// Share down a piecewise-linear profile at `t` (0 = top of the card, 1 = bottom).
+fn profile(table: &[(f32, f32)], t: f32) -> f32 {
+    let mut prev = table[0];
+    for &(at, share) in &table[1..] {
+        if t <= at {
+            let span = at - prev.0;
+            let k = if span <= 0.0 {
+                1.0
+            } else {
+                (t - prev.0) / span
+            };
+            return prev.1 + (share - prev.1) * k;
+        }
+        prev = (at, share);
+    }
+    table[table.len() - 1].1
+}
 
 // Eye-comfort rules: the content inset must clear the corner radius so text never
 // grazes the curve — `main::pad_for` floors it at `CORNER_RADIUS` — and the panel
@@ -52,11 +82,13 @@ pub const SEPARATION: u32 = 12;
 /// Translucent glass body: the alpha is what the compositor blends with the
 /// wallpaper, so the buffer is premultiplied (`draw` does that).
 pub const BG_NORMAL: Bgra = bgra(0x1e, 0x1e, 0x1e, 0xd4);
-pub const FG_NORMAL: Bgra = bgra(0xbb, 0xbb, 0xbb, 0xff);
+/// Apple's system greys, straight from plush's palette: rows are the secondary
+/// ink, the input line and the selection are the primary one.
+pub const FG_NORMAL: Bgra = bgra(0xeb, 0xeb, 0xf5, 0x9b);
 /// Input bar: a subtly lighter tone than the list, so bar and list read as
 /// separate pieces of one panel.
 pub const BG_PROMPT: Bgra = bgra(0x2c, 0x2c, 0x2c, 0xdc);
-pub const FG_PROMPT: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
+pub const FG_PROMPT: Bgra = bgra(0xff, 0xff, 0xff, 0xf5);
 /// Prompt label accent: a 4px rail on the input bar's left edge (option F); a
 /// deep slate blue that carries the emphasis while staying harmonious with the
 /// gray bar and apart from the selection blue.
@@ -455,14 +487,19 @@ fn body(buf: &mut [u8], w: u32, panel: &Panel, bg: Bgra) {
             over_pm(&mut buf[(by * w + x1) as usize * 4..][..4], bg, cov);
         }
         // Hairline on the outermost pixel: the seam where the body meets the
-        // shadow. Lit along the top, fading out over the card, dark underneath.
-        let t = 1.0 - rel as f32 / panel.h as f32;
-        let light = (BORDER_LIGHT_ALPHA as f32 * t * t).round() as u32;
+        // shadow — lit along the top, dark underneath, cross-fading between.
+        let t = rel as f32 / panel.h.max(1) as f32;
+        let dark = (BORDER_DARK_ALPHA as f32 * profile(&BORDER_DARK, t)).round() as u32;
+        let light = (BORDER_LIGHT_ALPHA as f32 * profile(&BORDER_LIT, t)).round() as u32;
         if x0 < x1 {
             for x in [x0, x1 - 1] {
                 let dst = &mut buf[(by * w + x) as usize * 4..][..4];
-                over_pm(dst, [0, 0, 0, 0xff], BORDER_DARK_ALPHA);
-                over_pm(dst, [0xff, 0xff, 0xff, 0xff], light);
+                if dark > 0 {
+                    over_pm(dst, [0, 0, 0, 0xff], dark);
+                }
+                if light > 0 {
+                    over_pm(dst, [0xff, 0xff, 0xff, 0xff], light);
+                }
             }
         }
     }
@@ -961,6 +998,18 @@ mod tests {
         premul(c)
     }
 
+    /// What the caret draws: the input ink composited over the bar body. The ink is
+    /// translucent, so it is not bit-equal to the palette entry any more.
+    fn caret_px(c: &Colors) -> Bgra {
+        let mut dst = premul(c.bg_prompt);
+        blend_px(
+            &mut dst,
+            [c.fg_prompt[0], c.fg_prompt[1], c.fg_prompt[2]],
+            c.fg_prompt[3] as u32,
+        );
+        dst
+    }
+
     /// Panel height for `rows` result rows: bar, the separating gap, the list.
     fn frame_h(row_h: u32, rows: u32, scale: u32) -> u32 {
         row_h * (rows + 1) + SEPARATION * scale
@@ -1280,13 +1329,18 @@ mod tests {
         let mid = font.row_h / 2; // inside the bar card
         assert_eq!(px(1, mid), &pm(colors.bg_prompt), "body starts at x=1");
         assert_ne!(px(0, mid), &pm(colors.bg_prompt), "ring at x=0");
-        // Lit along the top, dark along the bottom: that is what makes the edge
-        // read as a glass rim instead of a hard cut. Inside the bar card's flat
-        // band — above/below the corner radius the rim is off the body.
+        // Lit along the top, dark underneath: that is what makes the edge read as a
+        // glass rim instead of a hard cut. Both probes sit inside a card's flat band.
         let top = CORNER_RADIUS;
-        let bottom = font.row_h - CORNER_RADIUS - 1;
         assert!(px(0, top)[0] > px(1, top)[0], "top rim is lit");
-        assert!(px(0, bottom)[0] < px(1, bottom)[0], "bottom rim is dark");
+        // A one-row bar is too short to cross-fade; the list card is the tall one.
+        let bottom = h - CORNER_RADIUS - 2;
+        assert!(
+            px(0, bottom)[0] < px(1, bottom)[0],
+            "bottom rim is dark: ring {:?} against body {:?}",
+            px(0, bottom),
+            px(1, bottom)
+        );
     }
 
     /// The shadow wraps a corner instead of being cut off at it: measured straight
@@ -1611,8 +1665,8 @@ mod tests {
         );
         let mid = font.row_h / 2;
         let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
-        let solid = (1..w - 3)
-            .any(|x| px(x, mid) == colors.fg_prompt && px(x + 1, mid) == colors.fg_prompt);
+        let ink = caret_px(&colors);
+        let solid = (1..w - 3).any(|x| px(x, mid) == ink && px(x + 1, mid) == ink);
         assert!(!solid, "blinked-off caret must not be drawn");
     }
 
@@ -1866,12 +1920,13 @@ mod tests {
             // glyph ink is always anti-aliased, so it can't fake this. It also
             // proves ink over the translucent body raises alpha to opaque.
             let mid = font.row_h / 2;
+            let ink = caret_px(&colors);
             let mut caret_x = None;
             for x in 1..w - 3 {
-                if px(x, mid) == colors.fg_prompt
-                    && px(x + 1, mid) == colors.fg_prompt
-                    && px(x - 1, mid) != colors.fg_prompt
-                    && px(x + 2, mid) != colors.fg_prompt
+                if px(x, mid) == ink
+                    && px(x + 1, mid) == ink
+                    && px(x - 1, mid) != ink
+                    && px(x + 2, mid) != ink
                 {
                     caret_x = Some(x);
                     break;
@@ -1886,7 +1941,7 @@ mod tests {
             let mut top = None;
             let mut bottom = None;
             for y in 0..font.row_h {
-                let solid = px(x, y) == colors.fg_prompt && px(x + 1, y) == colors.fg_prompt;
+                let solid = px(x, y) == ink && px(x + 1, y) == ink;
                 if solid && top.is_none() {
                     top = Some(y);
                 }
@@ -1934,12 +1989,9 @@ mod tests {
                 );
                 let mid = font.row_h / 2;
                 let at = |x: u32| &buf[idx(bw, 1, x, mid)..][..4];
+                let ink = caret_px(&colors);
                 for x in 1..w - 3 {
-                    if at(x) == colors.fg_prompt
-                        && at(x + 1) == colors.fg_prompt
-                        && at(x - 1) != colors.fg_prompt
-                        && at(x + 2) != colors.fg_prompt
-                    {
+                    if at(x) == ink && at(x + 1) == ink && at(x - 1) != ink && at(x + 2) != ink {
                         return x;
                     }
                 }
