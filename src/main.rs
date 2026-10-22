@@ -1451,7 +1451,7 @@ mod tests {
             "a zero row height must not divide by zero"
         );
         // `-b` sits SHADOW from the bottom edge: symmetric around that gap.
-        assert_eq!(max_rows(1080, row, render::SHADOW, 1), 33);
+        assert_eq!(max_rows(1080, row, render::SHADOW, 1), 32);
     }
 
     /// The panel's default size follows the output: width a fixed fraction of it,

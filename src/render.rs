@@ -14,32 +14,48 @@ pub const CORNER_RADIUS: u32 = 12;
 
 /// Space reserved around the panel for its drop shadow (logical px). The buffer
 /// and the layer surface grow by it; the panel keeps its size and position.
-pub const SHADOW: u32 = 20;
+pub const SHADOW: u32 = 26;
 
 /// Shadow layers as (blur radius, alpha at the panel edge, vertical offset),
 /// logical px and 0-255. A tight contact shadow under a wide ambient one; the
 /// offset is positive because the light comes from above.
-const SHADOW_TIGHT: (u32, u32, u32) = (6, 155, 1);
-const SHADOW_WIDE: (u32, u32, u32) = (13, 115, 4);
+const SHADOW_TIGHT: (u32, u32, u32) = (9, 120, 2);
+const SHADOW_WIDE: (u32, u32, u32) = (20, 95, 6);
 // The margin must fit the widest layer, or its falloff is cut off at the buffer edge.
 const _: () = assert!(SHADOW >= SHADOW_WIDE.0 + SHADOW_WIDE.2);
 
-/// Hairline on the panel's outermost pixel — the seam between the translucent
-/// body and the shadow. Its lit ink is solid along the top edge and gone by the
-/// lower third; its dark underside starts past the middle and is whole at the
-/// bottom. Between them the edge carries a little of both, which is what keeps it
-/// visible against the wallpaper without drawing a line around the panel.
+/// Rim on the panel's outermost pixel — the seam between the translucent body
+/// and the shadow. Its lit half holds its strength down the top corner arcs and
+/// then dies quickly, so it reads as a specular on glass rather than a wash over
+/// the upper half; its dark underside stays out of the way until the lower third
+/// and is whole at the bottom. Between them the edge carries a little of both,
+/// which is what keeps it visible against the wallpaper without drawing a line
+/// around the panel.
 /// (Same profiles as plush, so both panels share one chrome.)
-const BORDER_LIGHT_ALPHA: u32 = 34;
-const BORDER_DARK_ALPHA: u32 = 60;
+const BORDER_LIGHT_ALPHA: u32 = 90;
+const BORDER_DARK_ALPHA: u32 = 90;
 const BORDER_LIT: [(f32, f32); 5] = [
     (0.0, 1.0),
-    (0.28, 0.62),
-    (0.55, 0.21),
-    (0.85, 0.0),
+    (0.16, 0.9),
+    (0.42, 0.55),
+    (0.78, 0.0),
     (1.0, 0.0),
 ];
-const BORDER_DARK: [(f32, f32); 4] = [(0.0, 0.0), (0.5, 0.1), (0.82, 0.63), (1.0, 1.0)];
+const BORDER_DARK: [(f32, f32); 5] = [
+    (0.0, 0.08),
+    (0.45, 0.15),
+    (0.72, 0.4),
+    (0.9, 0.85),
+    (1.0, 1.0),
+];
+
+/// A dark band one pixel inside the rim, same shape as the halves above. It is
+/// what makes the lit edge read as something with thickness: the top of a glass
+/// edge has only the wall below it, so the band starts there at nothing and is
+/// whole along the bottom edge, where the body shadows its own lower wall.
+const BORDER_INNER: [(f32, f32); 5] =
+    [(0.0, 0.0), (0.3, 0.05), (0.6, 0.3), (0.85, 0.8), (1.0, 1.0)];
+const BORDER_INNER_ALPHA: u32 = 130;
 
 /// Share down a piecewise-linear profile at `t` (0 = top of the card, 1 = bottom).
 fn profile(table: &[(f32, f32)], t: f32) -> f32 {
@@ -486,11 +502,12 @@ fn body(buf: &mut [u8], w: u32, panel: &Panel, bg: Bgra) {
         if cov > 0 && x1 < w {
             over_pm(&mut buf[(by * w + x1) as usize * 4..][..4], bg, cov);
         }
-        // Hairline on the outermost pixel: the seam where the body meets the
-        // shadow — lit along the top, dark underneath, cross-fading between.
+        // Rim on the outermost pixel: the seam where the body meets the shadow —
+        // lit along the top, dark underneath, cross-fading between.
         let t = rel as f32 / panel.h.max(1) as f32;
         let dark = (BORDER_DARK_ALPHA as f32 * profile(&BORDER_DARK, t)).round() as u32;
         let light = (BORDER_LIGHT_ALPHA as f32 * profile(&BORDER_LIT, t)).round() as u32;
+        let band = (BORDER_INNER_ALPHA as f32 * profile(&BORDER_INNER, t)).round() as u32;
         if x0 < x1 {
             for x in [x0, x1 - 1] {
                 let dst = &mut buf[(by * w + x) as usize * 4..][..4];
@@ -500,6 +517,17 @@ fn body(buf: &mut [u8], w: u32, panel: &Panel, bg: Bgra) {
                 if light > 0 {
                     over_pm(dst, [0xff, 0xff, 0xff, 0xff], light);
                 }
+            }
+        }
+        // One pixel further in: the dark band that gives the rim its thickness.
+        // Skipped when the row is too narrow for two distinct pixels.
+        if band > 0 && x1 - x0 >= 4 {
+            for x in [x0 + 1, x1 - 2] {
+                over_pm(
+                    &mut buf[(by * w + x) as usize * 4..][..4],
+                    [0, 0, 0, 0xff],
+                    band,
+                );
             }
         }
     }
@@ -1306,7 +1334,7 @@ mod tests {
     #[test]
     fn border_ring_is_one_pixel_wide() {
         let font = MenuFont::load(None, 20.0).expect("system font available");
-        let (w, h) = (200u32, font.row_h * 3);
+        let (w, h) = (200u32, frame_h(font.row_h, 8, 1));
         let (bw, bh) = frame_size(w, h, 1);
         let mut buf = vec![0u8; (bw * bh * 4) as usize];
         let colors = Colors::default();
@@ -1327,19 +1355,66 @@ mod tests {
         );
         let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
         let mid = font.row_h / 2; // inside the bar card
-        assert_eq!(px(1, mid), &pm(colors.bg_prompt), "body starts at x=1");
+        // x=0 is the rim, x=1 the dark band inside it, so the body starts at x=2.
+        assert_eq!(px(2, mid), &pm(colors.bg_prompt), "body starts at x=2");
         assert_ne!(px(0, mid), &pm(colors.bg_prompt), "ring at x=0");
         // Lit along the top, dark underneath: that is what makes the edge read as a
         // glass rim instead of a hard cut. Both probes sit inside a card's flat band.
         let top = CORNER_RADIUS;
-        assert!(px(0, top)[0] > px(1, top)[0], "top rim is lit");
-        // A one-row bar is too short to cross-fade; the list card is the tall one.
-        let bottom = h - CORNER_RADIUS - 2;
+        assert!(px(0, top)[0] > px(2, top)[0], "top rim is lit");
+        // The rim only turns clearly dark where the lit half has faded out, so the
+        // list card has to be tall enough for its straight run to reach there.
+        let bottom = h - CORNER_RADIUS - 4;
         assert!(
-            px(0, bottom)[0] < px(1, bottom)[0],
+            px(0, bottom)[0] < px(2, bottom)[0],
             "bottom rim is dark: ring {:?} against body {:?}",
             px(0, bottom),
-            px(1, bottom)
+            px(2, bottom)
+        );
+    }
+
+    /// The dark band one pixel inside the rim is what makes the lit edge read as
+    /// glass with thickness: nothing is above the top of the wall to shadow it, so
+    /// the band starts at nothing there, and the body shadows its own lower wall.
+    #[test]
+    fn a_dark_band_sits_one_pixel_inside_the_rim() {
+        let font = MenuFont::load(None, 20.0).expect("system font available");
+        let rows = 8u32;
+        let (w, h) = (240u32, frame_h(font.row_h, rows, 1));
+        let (bw, bh) = frame_size(w, h, 1);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
+        draw(
+            &mut buf,
+            bw,
+            bh,
+            &font,
+            "",
+            "",
+            false,
+            &[],
+            PAD,
+            &Colors::default(),
+            1,
+            false,
+            Subpixel::Gray,
+        );
+        let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
+        let list_h = font.row_h * rows;
+        let top = row_y(font.row_h, 0, 1);
+        // `t` is 0 on the card's first row, so the band adds nothing there; that row
+        // is inside the corner arcs, where the band's pixel is still in the span.
+        let x0 = rounded_inset(w, list_h, CORNER_RADIUS, 0).ceil() as u32;
+        assert_eq!(
+            px(x0 + 1, top),
+            px(x0 + 2, top),
+            "nothing shadows the top of the wall"
+        );
+        let body = px(3, top + 2 * font.row_h);
+        let deep = top + list_h * 9 / 10;
+        assert!(
+            px(1, deep)[0] + 8 < body[0],
+            "the lower wall is in shadow: band {:?} against body {body:?}",
+            px(1, deep)
         );
     }
 
