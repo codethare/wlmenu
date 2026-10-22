@@ -25,37 +25,31 @@ const SHADOW_WIDE: (u32, u32, u32) = (20, 95, 6);
 const _: () = assert!(SHADOW >= SHADOW_WIDE.0 + SHADOW_WIDE.2);
 
 /// Rim on the panel's outermost pixel — the seam between the translucent body
-/// and the shadow. Its lit half holds its strength down the top corner arcs and
-/// then dies quickly, so it reads as a specular on glass rather than a wash over
-/// the upper half; its dark underside stays out of the way until the lower third
-/// and is whole at the bottom. Between them the edge carries a little of both,
-/// which is what keeps it visible against the wallpaper without drawing a line
-/// around the panel.
-/// (Same profiles as plush, so both panels share one chrome.)
-const BORDER_LIGHT_ALPHA: u32 = 90;
-const BORDER_DARK_ALPHA: u32 = 90;
+/// and the shadow. Read the way macOS 27 reads a window edge: the contour is a
+/// dark edge that runs the whole height, a specular brightens only its upper
+/// reaches, and the drop shadow carries the layering. So the lit ink is dimmer
+/// than a line and has died by the lower half, while the dark ink is present
+/// from the top and whole at the bottom.
+/// (plush keeps SPEC-UI-009's numbers; the two differ on purpose.)
+const BORDER_LIGHT_ALPHA: u32 = 60;
+const BORDER_DARK_ALPHA: u32 = 110;
 const BORDER_LIT: [(f32, f32); 5] = [
     (0.0, 1.0),
-    (0.16, 0.9),
-    (0.42, 0.55),
-    (0.78, 0.0),
+    (0.12, 0.9),
+    (0.45, 0.35),
+    (0.72, 0.06),
     (1.0, 0.0),
 ];
-const BORDER_DARK: [(f32, f32); 5] = [
-    (0.0, 0.08),
-    (0.45, 0.15),
-    (0.72, 0.4),
-    (0.9, 0.85),
-    (1.0, 1.0),
-];
+const BORDER_DARK: [(f32, f32); 4] = [(0.0, 0.3), (0.5, 0.5), (0.78, 0.85), (1.0, 1.0)];
 
 /// A dark band one pixel inside the rim, same shape as the halves above. It is
 /// what makes the lit edge read as something with thickness: the top of a glass
 /// edge has only the wall below it, so the band starts there at nothing and is
-/// whole along the bottom edge, where the body shadows its own lower wall.
+/// whole along the bottom edge, where the body shadows its own lower wall. A
+/// hint of thickness, not a second stroke.
 const BORDER_INNER: [(f32, f32); 5] =
     [(0.0, 0.0), (0.3, 0.05), (0.6, 0.3), (0.85, 0.8), (1.0, 1.0)];
-const BORDER_INNER_ALPHA: u32 = 130;
+const BORDER_INNER_ALPHA: u32 = 100;
 
 /// Share down a piecewise-linear profile at `t` (0 = top of the card, 1 = bottom).
 fn profile(table: &[(f32, f32)], t: f32) -> f32 {
