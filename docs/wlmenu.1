@@ -113,7 +113,10 @@ Desktop entries win when a name appears in both.  Hidden entries, entries that
 need a terminal (\fBTerminal=true\fR), entries restricted to other desktops
 (\fBOnlyShowIn\fR/\fBNotShowIn\fR), and non-executable files in
 \fBPATH\fR directories are skipped; a localized \fBName[locale]\fR is preferred
-when it matches the user's locale.
+when it matches the user's locale.  An xdg-activation token is requested for
+the menu surface and passed to the launched process in
+.BR XDG_ACTIVATION_TOKEN ,
+so the new window can take focus.
 .TP
 .B \-v ", " \-\-version
 Print the version and exit.

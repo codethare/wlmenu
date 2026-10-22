@@ -48,5 +48,5 @@
 
 - 无 IME：输入法协议客户端不做
 - 列表可见上限 64 行（shm 缓冲有界），`-l N` 控制固定高度
-- `--run` 无 xdg-activation token，启动窗口可能不抢焦点
+- `--run` 的 xdg-activation token 只带 surface、无 input serial（sctk 的 KeyEvent 不含 serial），要求 serial 的合成器仍可能不聚焦
 

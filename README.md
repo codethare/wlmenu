@@ -43,6 +43,8 @@ the whole UI is drawn by `ab_glyph`.
   entries winning. Hidden entries, `Terminal=true` entries, entries for other
   desktops (`OnlyShowIn`/`NotShowIn`), and non-executable PATH files are
   skipped; a localized `Name[locale]` is preferred when it matches the locale.
+  The launched process gets an xdg-activation token in
+  `XDG_ACTIVATION_TOKEN` so its window can take focus.
 - one panel per Wayland session: launching `wlmenu` again dismisses the running
   menu (same as Escape, no output, exit 1) instead of stacking a second bar on
   top of the first — so a launcher keybind toggles open/closed
@@ -104,8 +106,9 @@ install it with
   protocol client, same as wmenu. Filtering CJK *labels* works fine.
 - Long stdin lists are capped at 64 visible rows and scroll (keeps the shm
   buffer bounded); pass `-l N` for a fixed height.
-- No xdg-activation token on launch (`--run`); windows may not grab focus on
-  some compositors.
+- The `--run` activation token carries only the surface, no input serial (sctk
+  drops it), so compositors that insist on a serial may still not focus the
+  launched window.
 - Fractional output scaling (1.25/1.5) renders at the output's integer scale;
   HiDPI integer scales (2x) render natively crisp.
 - Subpixel antialiasing assumes an RGB-stripe panel. On a BGR panel (text

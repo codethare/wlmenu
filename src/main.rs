@@ -25,6 +25,7 @@ use smithay_client_toolkit::reexports::calloop::{EventLoop, Interest, Mode, Post
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 
 use smithay_client_toolkit::{
+    activation::{ActivationHandler, ActivationState, RequestData},
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
     delegate_registry,
     output::{OutputHandler, OutputState},
@@ -268,6 +269,9 @@ fn main() {
         layer: None,
         pool,
         qh: qh.clone(),
+        conn: conn.clone(),
+        activation: ActivationState::bind(&globals, &qh).ok(),
+        token: None,
         keyboard: None,
         items,
         feed,
@@ -297,6 +301,7 @@ fn main() {
         shown_h: bar_h,
         first_configure: true,
         run: opts.run,
+        launches: Vec::new(),
         no_items: false,
         mods: Modifiers::default(),
         // Cloned: the loop sources are inserted after the `-o` roundtrip.
@@ -392,6 +397,7 @@ fn main() {
         {
             break;
         }
+        app.flush_launches();
         app.sync_items();
         app.tick();
         if app.menu.done.is_some() {
@@ -692,6 +698,13 @@ struct App {
     layer: Option<LayerSurface>,
     pool: SlotPool,
     qh: QueueHandle<App>,
+    /// Kept for the private activation queue `--run` launches roundtrip on.
+    conn: Connection,
+    /// xdg-activation, when the compositor offers it: a launched window without
+    /// a token may not be allowed to take focus.
+    activation: Option<ActivationState>,
+    /// Token from the most recent activation request.
+    token: Option<String>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     /// Latest modifier state; sctk drops modifiers from KeyEvent, so
     /// `update_modifiers` is the only place they arrive.
@@ -740,6 +753,9 @@ struct App {
     shown_h: u32,
     first_configure: bool,
     run: bool,
+    /// `--run` picks waiting to be spawned. Filled from key handlers, drained
+    /// outside the dispatch, where the activation roundtrip is safe.
+    launches: Vec<String>,
     /// Stdin closed without producing a single line (keeps the old
     /// `wlmenu: no items` + exit 1 contract).
     no_items: bool,
@@ -904,7 +920,7 @@ impl App {
         let picked = std::mem::take(&mut self.menu.picked);
         for v in picked {
             if self.run {
-                self.launch(&v);
+                self.launches.push(v);
             } else {
                 println!("{v}");
             }
@@ -912,13 +928,43 @@ impl App {
         self.request_draw();
     }
 
+    /// Spawn queued `--run` picks. Called outside the dispatch: the token below
+    /// dispatches events, which must not happen inside a handler.
+    fn flush_launches(&mut self) {
+        for cmd in std::mem::take(&mut self.launches) {
+            self.launch(&cmd);
+        }
+    }
+
     /// Spawn a `--run` selection via sh (selections are shell command lines).
-    fn launch(&self, cmd: &str) {
-        let _ = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .stdin(std::process::Stdio::null())
-            .spawn();
+    fn launch(&mut self, cmd: &str) {
+        let mut child = std::process::Command::new("sh");
+        child.arg("-c").arg(cmd).stdin(std::process::Stdio::null());
+        if let Some(token) = self.activation_token() {
+            child.env("XDG_ACTIVATION_TOKEN", token);
+        }
+        let _ = child.spawn();
+    }
+
+    /// xdg-activation token for the window about to be launched, the way
+    /// `wmenu-run` gets one. The request goes on a private queue — the loop's
+    /// queue belongs to `WaylandSource`, and dispatching it from here would
+    /// spin — and the sync sent after the commit is answered after the token.
+    /// Surface only: sctk's `KeyEvent` carries no serial to attach.
+    fn activation_token(&mut self) -> Option<String> {
+        let surface = self.layer.as_ref()?.wl_surface().clone();
+        let mut queue = self.conn.new_event_queue::<App>();
+        self.activation.as_ref()?.request_token(
+            &queue.handle(),
+            RequestData {
+                app_id: None,
+                seat_and_serial: None,
+                surface: Some(surface),
+                udata: (),
+            },
+        );
+        queue.roundtrip(self).ok()?;
+        self.token.take()
     }
 
     fn request_draw(&mut self) {
@@ -1311,6 +1357,14 @@ impl OutputHandler for App {
 impl ShmHandler for App {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
+    }
+}
+
+impl ActivationHandler for App {
+    type RequestUdata = ();
+
+    fn new_token(&mut self, token: String, _: &RequestData<()>) {
+        self.token = Some(token);
     }
 }
 
