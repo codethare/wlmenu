@@ -2,10 +2,12 @@
 
 use std::time::{Duration, Instant};
 
-/// Height transition length for expand/collapse (Spotlight-style).
-const ANIM: Duration = Duration::from_millis(120);
+/// Height transition length for expand/collapse (Spotlight-style). Long enough to
+/// read as motion rather than a jump; short enough that a size change caused by a
+/// keystroke still feels immediate.
+const ANIM: Duration = Duration::from_millis(180);
 
-/// Height transition: ease-out cubic from `from` to `to`, in buffer pixels.
+/// Height transition: ease-in-out cubic from `from` to `to`, in buffer pixels.
 /// Frame cost is ~2 ms even at 64 rows, so animating is affordable.
 pub(crate) struct Anim {
     pub(crate) from: u32,
@@ -20,7 +22,15 @@ impl Anim {
         if t >= 1.0 {
             return (self.to, false);
         }
-        let e = 1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3);
+        // Ease in and out: both ends move at nearly zero speed, so the eye reads a
+        // glide with no jolt. A pure ease-out (which this used to be) starts at
+        // full speed; that was invisible only because the transition was short.
+        let t = t.clamp(0.0, 1.0);
+        let e = if t < 0.5 {
+            4.0 * t * t * t
+        } else {
+            1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+        };
         let h = self.from as f32 + (self.to as f32 - self.from as f32) * e;
         (h.round().max(0.0) as u32, true)
     }
@@ -39,6 +49,11 @@ mod tests {
             start,
         };
         assert_eq!(grow.height(start), (24, true), "starts at the from height");
+        let (early, _) = grow.height(start + ANIM / 10);
+        assert!(
+            early - 24 < (1560 - 24) / 20,
+            "the curve eases in: {early} after a tenth of the way"
+        );
         let (mid, running) = grow.height(start + ANIM / 2);
         assert!(
             running && mid > 24 && mid < 1560,
