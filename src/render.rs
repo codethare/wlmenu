@@ -163,10 +163,13 @@ pub fn parse_color(s: &str) -> Option<Bgra> {
     }
 }
 
-/// One visible item row (text already resolved).
+/// One visible item row (text already resolved). `fade` (0-255) is how opaque its
+/// ink is: 255 for a row that was already on screen, ramping up for one that just
+/// arrived under a keystroke (SPEC-UI-013).
 pub struct Row<'a> {
     pub text: &'a str,
     pub selected: bool,
+    pub fade: u8,
 }
 
 /// Horizontal pixel span `[x0, x1)` of the rounded panel at row `y`
@@ -765,6 +768,18 @@ pub fn draw_panel(
         } else {
             colors.fg_normal
         };
+        // Alpha is the fade: premultiplied ink scales with it in `blit_plane`
+        // (`a = cov * color[3] / 255`), so a fresh row costs nothing extra.
+        let fg = if row.fade == 255 {
+            fg
+        } else {
+            [
+                fg[0],
+                fg[1],
+                fg[2],
+                (fg[3] as u32 * row.fade as u32 / 255) as u8,
+            ]
+        };
         draw_text(
             buf,
             w,
@@ -1120,14 +1135,17 @@ mod tests {
             Row {
                 text: "Firefox 火狐浏览器",
                 selected: true,
+                fade: 255,
             },
             Row {
                 text: "Terminal",
                 selected: false,
+                fade: 255,
             },
             Row {
                 text: "Settings",
                 selected: false,
+                fade: 255,
             },
         ];
         draw(
@@ -1227,6 +1245,7 @@ mod tests {
         let rows = [Row {
             text: "Firefox 火狐",
             selected: true,
+            fade: 255,
         }];
         let mut a = vec![0u8; (bw * bh * 4) as usize];
         draw(
@@ -1681,6 +1700,7 @@ mod tests {
             &[Row {
                 text: "app",
                 selected: false,
+                fade: 255,
             }],
             PAD,
             &def,
@@ -1715,6 +1735,7 @@ mod tests {
             &[Row {
                 text: "",
                 selected: true,
+                fade: 255,
             }],
             PAD,
             &colors,
@@ -1986,6 +2007,7 @@ mod tests {
             &[Row {
                 text: "",
                 selected: true,
+                fade: 255,
             }],
             PAD,
             &def,
@@ -2199,5 +2221,47 @@ mod tests {
                 "label and input must be separated by ~{separators}px, got {delta}"
             );
         }
+    }
+    /// A row at `fade` 0 leaves the list card exactly as the body painted it: the
+    /// fade is ink opacity, not a separate drawing path, which is what makes it
+    /// cost nothing.
+    #[test]
+    fn a_row_at_zero_fade_leaves_the_card_untouched() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (320u32, frame_h(font.row_h, 1, 1));
+        let (bw, bh) = frame_size(w, h, 1);
+        let colors = Colors::default();
+        let render = |rows: &[Row]| {
+            let mut buf = vec![0u8; (bw * bh * 4) as usize];
+            draw(
+                &mut buf,
+                bw,
+                bh,
+                &font,
+                "",
+                "m",
+                false,
+                rows,
+                PAD,
+                &colors,
+                1,
+                true,
+                Subpixel::Gray,
+            );
+            buf
+        };
+        let full = render(&[Row {
+            text: "MMMM",
+            selected: false,
+            fade: 255,
+        }]);
+        let faint = render(&[Row {
+            text: "MMMM",
+            selected: false,
+            fade: 0,
+        }]);
+        let none = render(&[]);
+        assert_ne!(full, faint, "full ink writes something");
+        assert_eq!(faint, none, "a faded-out row is not drawn at all");
     }
 }

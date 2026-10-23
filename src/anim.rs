@@ -5,30 +5,43 @@ use std::time::{Duration, Instant};
 /// Transition length (Spotlight-style). Long enough to read as motion rather than
 /// a jump; short enough that a size change caused by a keystroke still feels
 /// immediate.
-const ANIM: Duration = Duration::from_millis(180);
+pub(crate) const ANIM: Duration = Duration::from_millis(180);
 
-/// Height and opacity transition: ease-in-out cubic from `from_*` to `to_*`.
+/// Exit length. The panel leaves faster than it arrives: arriving slowly is
+/// what lets the eye find it, leaving quickly is what stops it from being in the
+/// way (SPEC-UI-013).
+pub(crate) const EXIT: Duration = Duration::from_millis(100);
+
+/// Height and opacity transition from `from_*` to `to_*` over `dur`.
 /// Frame cost is ~2 ms even at 64 rows, so animating is affordable.
 pub(crate) struct Anim {
     pub(crate) from_h: u32,
     pub(crate) to_h: u32,
     pub(crate) from_a: f32,
     pub(crate) to_a: f32,
+    pub(crate) dur: Duration,
     pub(crate) start: Instant,
 }
 
 impl Anim {
     /// Height in buffer px, opacity 0..=1, and whether the transition is running.
     pub(crate) fn at(&self, now: Instant) -> (u32, f32, bool) {
-        let t = now.saturating_duration_since(self.start).as_secs_f32() / ANIM.as_secs_f32();
+        let dur = self.dur.as_secs_f32().max(f32::EPSILON);
+        let t = now.saturating_duration_since(self.start).as_secs_f32() / dur;
         if t >= 1.0 {
             return (self.to_h, self.to_a, false);
         }
-        // Ease in and out: both ends move at nearly zero speed, so the eye reads a
-        // glide with no jolt. A pure ease-out starts at full speed; that was
-        // invisible only because the transition used to be short.
         let t = t.clamp(0.0, 1.0);
-        let e = if t < 0.5 {
+        // The curve follows the direction of the fade, because that is the only
+        // thing direction is knowable from: opacity ramps down only on the exit.
+        let e = if self.to_a < self.from_a {
+            // Leaving: accelerate away. Settling on the way out would read as the
+            // panel arriving somewhere instead of dismissing.
+            t * t * t
+        } else if t < 0.5 {
+            // Ease in and out: both ends move at nearly zero speed, so the eye
+            // reads a glide with no jolt. A pure ease-out starts at full speed;
+            // that was invisible only because the transition used to be short.
             4.0 * t * t * t
         } else {
             1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
@@ -49,6 +62,7 @@ mod tests {
             to_h: to,
             from_a: 1.0,
             to_a: 1.0,
+            dur: ANIM,
             start: Instant::now(),
         }
     }
@@ -98,6 +112,7 @@ mod tests {
                 to_h: 0,
                 from_a,
                 to_a,
+                dur: ANIM,
                 start,
             };
             let mut prev = from_a;
@@ -111,5 +126,37 @@ mod tests {
             }
             assert_eq!(anim.at(start + ANIM).1, to_a);
         }
+    }
+
+    /// The exit is shorter than the entrance, fades only, and accelerates away
+    /// (ease-in) instead of settling: dimming late is what keeps it from looking
+    /// like the panel is arriving somewhere.
+    #[test]
+    fn exit_fades_out_faster_and_without_settling() {
+        let start = Instant::now();
+        // Height frozen, the way `begin_close` builds it.
+        let exit = Anim {
+            from_h: 300,
+            to_h: 300,
+            from_a: 1.0,
+            to_a: 0.0,
+            dur: EXIT,
+            start,
+        };
+        assert!(EXIT < ANIM, "the exit must be the shorter of the two");
+        assert_eq!(exit.at(start), (300, 1.0, true));
+        let (h, early, _) = exit.at(start + EXIT / 10);
+        assert_eq!(h, 300, "the exit does not resize the cards");
+        assert!(
+            early > 0.98,
+            "ease-in: a tenth of the way in, barely any fading: {early}"
+        );
+        let (_, late, _) = exit.at(start + EXIT * 9 / 10);
+        assert!(late < 0.4, "and most of it happens at the end: {late}");
+        let (_, gone, running) = exit.at(start + EXIT);
+        assert!(
+            !running && gone == 0.0,
+            "gone at EXIT, and the loop may stop"
+        );
     }
 }

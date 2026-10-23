@@ -11,7 +11,7 @@ mod font;
 mod items;
 mod render;
 
-use anim::Anim;
+use anim::{ANIM, Anim, EXIT};
 use control::Claim;
 use feed::ItemFeed;
 
@@ -74,6 +74,11 @@ const TOP_MARGIN: i32 = 32;
 // The panel sits inside the shadow margin, so the surface margin is the visible
 // gap minus the margin the shadow already occupies.
 const _: () = assert!(TOP_MARGIN >= render::SHADOW as i32);
+/// Where the panel's top edge sits on a known-height output: a bit over a quarter
+/// of the screen — the band the eye lands in without looking — leaving the rest
+/// of the height for the list. `TOP_MARGIN` is the floor, for a short output and
+/// for the frame before the height is known.
+const TOP_PCT: u32 = 26;
 /// ponytail: stdin can be huge; cap drawn rows and scroll instead of mapping a giant buffer.
 const MAX_VISIBLE: usize = 64;
 /// Rows of context kept above/below the selection while the list scrolls.
@@ -86,6 +91,12 @@ const MAX_LINES: usize = 1000;
 const BLINK_PERIOD: Duration = Duration::from_millis(500);
 /// Frame clock for height transitions and while stdin is still streaming.
 const FRAME: Duration = Duration::from_millis(16);
+/// How long a row that has just arrived takes to reach full opacity. Short
+/// enough that a fast typist never waits for it, long enough that the eye reads
+/// the row as arriving instead of the list as swapping.
+const CONTENT: Duration = Duration::from_millis(120);
+/// How long the overlay scrollbar lingers after the list last moved.
+const SCROLL_FADE: Duration = Duration::from_millis(400);
 struct Opts {
     prompt: String,
     /// `-W`: absolute width. `None` means "a fraction of the output width"
@@ -299,6 +310,11 @@ fn main() {
         anim: None,
         target_h: None,
         shown_h: bar_h,
+        prev_visible: Vec::new(),
+        baseline: Vec::new(),
+        last_query: String::new(),
+        content_start: None,
+        scroll_at: None,
         closing: false,
         sent: Sent::default(),
         first_configure: true,
@@ -375,7 +391,16 @@ fn main() {
     } else {
         Anchor::TOP
     });
-    layer.set_margin(if app.bottom { 0 } else { TOP_MARGIN }, 0, 0, 0);
+    layer.set_margin(
+        if app.bottom {
+            0
+        } else {
+            top_margin(app.output_h) as i32
+        },
+        0,
+        0,
+        0,
+    );
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
     // Start collapsed to the single input bar (Spotlight); the list appears
     // once the query has content. The pool keeps the max height for rows.
@@ -392,7 +417,10 @@ fn main() {
         // blink is the only thing left. Wayland input wakes the loop
         // immediately, so an idle menu goes from ~62 wakeups/s to ~2/s.
         let now = Instant::now();
-        let busy = app.streaming() || app.anim.as_ref().is_some_and(|a| a.at(now).2);
+        let busy = app.streaming()
+            || app.anim.as_ref().is_some_and(|a| a.at(now).2)
+            || app.content_fading(now)
+            || app.scroll_fading(now);
         if event_loop
             .dispatch(loop_timeout(busy, app.next_blink, now), &mut app)
             .is_err()
@@ -414,15 +442,45 @@ fn main() {
     app.finish();
 }
 
-/// How long the event loop may sleep. `busy` covers the two things that need
-/// the frame clock (a height transition, items still streaming in); otherwise
-/// the caret blink is the only deadline.
+/// How long the event loop may sleep. `busy` covers everything that needs the
+/// frame clock (a height transition, the row fade-in, the scrollbar fading, items
+/// still streaming in); otherwise the caret blink is the only deadline.
 fn loop_timeout(busy: bool, next_blink: Instant, now: Instant) -> Duration {
     if busy {
         FRAME
     } else {
         next_blink.saturating_duration_since(now)
     }
+}
+
+/// Opacity of a row that just arrived: 0 → 255 over `CONTENT`, ease-out. `None`
+/// means no refresh is running, so everything is whole.
+fn fresh_alpha(elapsed: Option<Duration>) -> u8 {
+    let Some(elapsed) = elapsed else {
+        return 255;
+    };
+    let t = (elapsed.as_secs_f32() / CONTENT.as_secs_f32()).clamp(0.0, 1.0);
+    ((1.0 - (1.0 - t).powi(3)) * 255.0).round() as u8
+}
+
+/// Opacity for one visible row: a row already on screen stays whole (no blink
+/// under a keystroke that merely reorders), one that just arrived ramps in.
+fn row_fade(prev: &[usize], index: usize, elapsed: Option<Duration>) -> u8 {
+    if prev.contains(&index) {
+        255
+    } else {
+        fresh_alpha(elapsed)
+    }
+}
+
+/// Opacity of the overlay scrollbar: full at the moment the list moved, gone
+/// `SCROLL_FADE` later. `None` means it has never moved, so there is no thumb.
+fn scroll_alpha(elapsed: Option<Duration>) -> u8 {
+    let Some(elapsed) = elapsed else {
+        return 0;
+    };
+    let t = (elapsed.as_secs_f32() / SCROLL_FADE.as_secs_f32()).clamp(0.0, 1.0);
+    ((1.0 - t) * 255.0).round() as u8
 }
 
 /// Top row of the visible window: keeps the selection in view with `SCROLLOFF`
@@ -455,16 +513,22 @@ fn valid_lines(n: usize) -> bool {
     n <= MAX_LINES
 }
 
-/// List rows that fit on an output `output_h` logical px tall: the panel keeps
-/// `gap` free above and below it, one row of that budget is the input bar, and
-/// the rest is list. Saturating throughout, so a screen too short for a single
-/// row yields 0 instead of underflowing into a huge count.
-fn max_rows(output_h: u32, row_h: u32, gap: u32, scale: u32) -> usize {
+fn top_margin(output_h: Option<u32>) -> u32 {
+    output_h.map_or(TOP_MARGIN as u32, |h| {
+        (h * TOP_PCT / 100).max(TOP_MARGIN as u32)
+    })
+}
+
+/// List rows that fit on an output `output_h` logical px tall between the panel's
+/// top and bottom gaps: one row of that budget is the input bar, and `SEPARATION`
+/// px is the air between it and the list. Saturating throughout, so a screen too
+/// short for a single row yields 0 instead of underflowing into a huge count.
+fn max_rows(output_h: u32, row_h: u32, top: u32, bottom: u32, scale: u32) -> usize {
     let s = scale.max(1);
     let budget = output_h
         .saturating_mul(s)
-        .saturating_sub(gap.saturating_mul(2).saturating_mul(s))
-        // The bar, plus the gap that separates it from the list.
+        .saturating_sub(top.saturating_mul(s))
+        .saturating_sub(bottom.saturating_mul(s))
         .saturating_sub(row_h)
         .saturating_sub(render::SEPARATION * s);
     (budget / row_h.max(1)) as usize
@@ -770,8 +834,20 @@ struct App {
     anim: Option<Anim>,
     target_h: Option<u32>,
     shown_h: u32,
-    /// The menu is on its way out: the cards fade and shrink, then the process
-    /// finishes with whatever `done` says.
+    /// Item indices drawn in the previous frame.
+    prev_visible: Vec<usize>,
+    /// The rows that were on screen when the query last changed. Held for the
+    /// length of the fade, so a row that arrived this refresh keeps ramping on
+    /// every frame instead of turning into a survivor on the second one; a row
+    /// already in it never blinks (SPEC-UI-013).
+    baseline: Vec<usize>,
+    last_query: String,
+    content_start: Option<Instant>,
+    /// When the list last moved (the viewport top changed); the overlay scrollbar
+    /// fades out from there.
+    scroll_at: Option<Instant>,
+    /// The menu is on its way out: the cards fade (the height is frozen), then the
+    /// process finishes with whatever `done` says.
     closing: bool,
     /// What the layer surface was last told, so frames that change nothing in its
     /// geometry send no requests.
@@ -805,6 +881,7 @@ impl App {
     /// Rows that fit on this output with the panel's gaps above and below;
     /// `None` until `surface_enter` reported the output height.
     fn screen_rows(&self) -> Option<usize> {
+        let output_h = self.output_h?;
         // `row_h` is buffer px; before the font is joined the provisional height
         // is the same value startup used to size the first commit.
         let row_h = match &self.font {
@@ -813,17 +890,33 @@ impl App {
             // startup used to size the first commit.
             None => font::row_h_for(self.font_px * self.scale as f32),
         };
-        let gap = if self.bottom {
-            render::SHADOW
+        // `-b` floats SHADOW off the bottom edge and reserves that at both ends;
+        // the top-anchored panel starts at its optical top and reserves only the
+        // shadow below, so the list is not squeezed by a margin twice.
+        let (top, bottom) = if self.bottom {
+            (render::SHADOW, render::SHADOW)
         } else {
-            TOP_MARGIN as u32
+            (top_margin(Some(output_h)), render::SHADOW)
         };
-        Some(max_rows(self.output_h?, row_h, gap, self.scale))
+        Some(max_rows(output_h, row_h, top, bottom, self.scale))
     }
 
     /// True while stdin is still feeding items in (`--run` never streams).
     fn streaming(&self) -> bool {
         self.feed.as_ref().is_some_and(|f| !f.done())
+    }
+
+    /// True while rows that just arrived are still fading in, so the loop keeps
+    /// the frame clock instead of sleeping to the next caret blink.
+    fn content_fading(&self, now: Instant) -> bool {
+        self.content_start
+            .is_some_and(|s| now.saturating_duration_since(s) < CONTENT)
+    }
+
+    /// True while the overlay scrollbar is still fading, for the same reason.
+    fn scroll_fading(&self, now: Instant) -> bool {
+        self.scroll_at
+            .is_some_and(|s| now.saturating_duration_since(s) < SCROLL_FADE)
     }
 
     /// Pull streamed stdin lines into the menu. Called every loop tick and
@@ -915,18 +1008,21 @@ impl App {
     /// Caret blink: toggle every `BLINK_PERIOD` while idle. Typing calls
     /// `wake_caret` so the caret stays solid while the user is working.
     fn tick(&mut self) {
+        let now = Instant::now();
         // Keep a transition moving; the loop's 16 ms timeout is our frame clock
-        // (the Wayland frame callback only paces real frames).
-        if let Some(a) = &self.anim
-            && a.at(Instant::now()).2
+        // (the Wayland frame callback only paces real frames). The row fade-in and
+        // the scrollbar fade need the same clock.
+        if self.anim.as_ref().is_some_and(|a| a.at(now).2)
+            || self.content_fading(now)
+            || self.scroll_fading(now)
         {
             self.request_draw();
         }
-        if Instant::now() < self.next_blink {
+        if now < self.next_blink {
             return;
         }
         self.blink = !self.blink;
-        self.next_blink = Instant::now() + BLINK_PERIOD;
+        self.next_blink = now + BLINK_PERIOD;
         self.request_draw();
     }
 
@@ -1027,24 +1123,55 @@ impl App {
         };
         let total = self.menu.matches.len();
 
+        // A new query means rows arrive. The query is compared here rather than in
+        // the key handler so every path that edits it (typing, backspace, Tab)
+        // restarts the fade without each having to remember to.
+        let now = Instant::now();
+        if self.last_query != self.menu.query {
+            // The baseline is what was on screen a frame ago, so a fast typist
+            // restarts the ramp for genuinely new rows only, not for the ones the
+            // previous keystroke just settled.
+            self.baseline.clone_from(&self.prev_visible);
+            self.last_query.clone_from(&self.menu.query);
+            self.content_start = Some(now);
+        }
+        let fresh = self.content_start.map(|s| now.saturating_duration_since(s));
+
         // Keep the selection in view with one row of context on each side
         // (scrolloff), so the band never sits flush against a panel edge while
         // more rows exist beyond it.
         let mut rows: Vec<render::Row> = Vec::with_capacity(visible);
+        let mut seen: Vec<usize> = Vec::with_capacity(visible);
+        let mut any_fresh = false;
         if visible > 0 {
-            self.top = viewport_top(self.menu.sel, self.top, visible, total);
-            let top = self.top;
+            let top = viewport_top(self.menu.sel, self.top, visible, total);
+            if top != self.top {
+                self.top = top;
+                // The thumb is an overlay: it appears when the list moves and
+                // fades once it stops (SPEC-UI-013).
+                self.scroll_at = Some(now);
+            }
             for (i, &mi) in self.menu.matches[top..(top + visible).min(total)]
                 .iter()
                 .enumerate()
             {
                 let it = &self.items[mi];
+                let fade = row_fade(&self.baseline, mi, fresh);
+                any_fresh |= fade != 255;
                 rows.push(render::Row {
                     text: &it.text,
                     selected: top + i == self.menu.sel,
+                    fade,
                 });
+                seen.push(mi);
             }
         }
+        // Nothing arrived, so nothing needs the frame clock: a keystroke that
+        // changes no visible row costs one frame instead of eight.
+        if !any_fresh {
+            self.content_start = None;
+        }
+        self.prev_visible = seen;
 
         let scale = self.scale;
         let w = self.width;
@@ -1064,8 +1191,10 @@ impl App {
         // keystroke, the collapse back to the bar, and the fade-out on the way
         // out. Each new destination restarts the ease from what is on screen now,
         // and keeps the opacity it is at, so the three never fight each other.
-        let now = Instant::now();
-        let target = if self.closing { 0 } else { target };
+        // Closing freezes the height: the cards leave by fading, not by shrinking,
+        // so nothing moves under the pointer on the way out (and the surface stops
+        // resizing for the last 100 ms of the process).
+        let target = if self.closing { self.shown_h } else { target };
         if self.target_h != Some(target) {
             let from_a = self.anim.as_ref().map_or(1.0, |a| a.at(now).1);
             self.anim = Some(Anim {
@@ -1073,6 +1202,7 @@ impl App {
                 to_h: target,
                 from_a,
                 to_a: if self.closing { 0.0 } else { 1.0 },
+                dur: ANIM,
                 start: now,
             });
             self.target_h = Some(target);
@@ -1105,7 +1235,7 @@ impl App {
                 .output_w
                 .map(|ow| ((ow as i64 - (w + 2 * render::SHADOW) as i64) / 2).max(0) as i32)
                 .unwrap_or(0);
-            (TOP_MARGIN - shadow, 0, 0, left)
+            (top_margin(self.output_h) as i32 - shadow, 0, 0, left)
         };
         if self.sent.margin != Some(margin) {
             layer.set_margin(margin.0, margin.1, margin.2, margin.3);
@@ -1159,8 +1289,10 @@ impl App {
             text_aa(scale),
         );
 
-        // Scroll position indicator: only while the list overflows the viewport.
+        // Scroll position indicator: an overlay thumb, only while the list
+        // overflows the viewport, fading out after the last movement.
         let sep = render::SEPARATION * scale;
+        let thumb_alpha = scroll_alpha(self.scroll_at.map(|s| now.saturating_duration_since(s)));
         if let Some((ty, th)) = render::scroll_thumb(
             row_h + sep,
             h.saturating_sub(row_h + sep),
@@ -1170,6 +1302,7 @@ impl App {
         ) {
             let tw = 3 * scale;
             let tx = bw - mo - (pad * scale + tw) / 2;
+            let accent = self.colors.label_accent;
             render::rect(
                 canvas,
                 bw,
@@ -1178,7 +1311,12 @@ impl App {
                 ty + mo,
                 tw,
                 th,
-                self.colors.label_accent,
+                [
+                    accent[0],
+                    accent[1],
+                    accent[2],
+                    (accent[3] as u32 * thumb_alpha as u32 / 255) as u8,
+                ],
             );
         }
 
@@ -1223,12 +1361,13 @@ impl App {
         let from_a = self.anim.as_ref().map_or(1.0, |a| a.at(now).1);
         self.anim = Some(Anim {
             from_h: self.shown_h,
-            to_h: 0,
+            to_h: self.shown_h,
             from_a,
             to_a: 0.0,
+            dur: EXIT,
             start: now,
         });
-        self.target_h = Some(0);
+        self.target_h = Some(self.shown_h);
         self.request_draw();
     }
 
@@ -1336,6 +1475,7 @@ impl LayerShellHandler for App {
                 to_h: h,
                 from_a: 0.0,
                 to_a: 1.0,
+                dur: ANIM,
                 start: Instant::now(),
             });
             self.draw();
@@ -1540,25 +1680,52 @@ mod tests {
     }
 
     /// The list stops where the panel would otherwise reach the screen edge: what
-    /// fits under the bar between two `gap` margins, not what `-l` asks for.
+    /// fits under the bar between the panel's top edge and the shadow below it.
     #[test]
     fn list_fits_between_the_screen_margins() {
-        let (row, gap) = (30, 32);
-        // 1080 - 2*32 margin = 1016 for bar + rows.
-        assert_eq!(max_rows(1080, row, gap, 1), 32);
-        assert_eq!(max_rows(1440, row, gap, 1), 44);
-        assert_eq!(max_rows(2160, row, gap, 1), 68);
+        let (row, shadow) = (30, render::SHADOW);
+        // 1080p: the top edge is 280 down, and the bottom reserves the shadow only.
+        assert_eq!(top_margin(Some(1080)), 280);
+        assert_eq!(max_rows(1080, row, top_margin(Some(1080)), shadow, 1), 24);
+        assert_eq!(max_rows(1440, row, top_margin(Some(1440)), shadow, 1), 33);
+        assert_eq!(max_rows(2160, row, top_margin(Some(2160)), shadow, 1), 51);
         // HiDPI: the same logical output gives the same number of rows.
-        assert_eq!(max_rows(1080, row * 2, gap, 2), 32);
+        assert_eq!(
+            max_rows(1080, row * 2, top_margin(Some(1080)), shadow, 2),
+            24
+        );
         // Too short for one row, or an absurd height: no rows, no underflow.
-        assert_eq!(max_rows(2 * gap + row, row, gap, 1), 0);
-        assert_eq!(max_rows(0, row, gap, 1), 0);
+        let top = top_margin(Some(1080));
+        assert_eq!(
+            max_rows(top + shadow + row + render::SEPARATION, row, top, shadow, 1),
+            0
+        );
+        assert_eq!(max_rows(0, row, top, shadow, 1), 0);
         assert!(
-            max_rows(1080, 0, gap, 1) <= 1080,
+            max_rows(1080, 0, top, shadow, 1) <= 1080,
             "a zero row height must not divide by zero"
         );
         // `-b` sits SHADOW from the bottom edge: symmetric around that gap.
-        assert_eq!(max_rows(1080, row, render::SHADOW, 1), 32);
+        assert_eq!(max_rows(1080, row, shadow, shadow, 1), 32);
+    }
+
+    /// The top edge is optical, not a fixed offset: about a quarter of the way
+    /// down a tall screen, and never above the floor that keeps the shadow on it.
+    #[test]
+    fn top_edge_is_optical_not_fixed() {
+        assert_eq!(
+            top_margin(None),
+            TOP_MARGIN as u32,
+            "before the output is known"
+        );
+        assert_eq!(top_margin(Some(1080)), 280);
+        assert_eq!(top_margin(Some(2160)), 561);
+        assert_eq!(
+            top_margin(Some(100)),
+            TOP_MARGIN as u32,
+            "a screen shorter than the floor clamps to it"
+        );
+        assert_eq!(top_margin(Some(900)), 234, "26% of the logical height");
     }
 
     /// The panel's default size follows the output: width a fixed fraction of it,
@@ -2046,5 +2213,42 @@ mod tests {
         key(&mut m, &items, Keysym::Tab, None);
         assert_eq!(m.query, "z");
         assert!(m.matches.is_empty());
+    }
+
+    /// A row that has just arrived ramps in; a row that was already on screen
+    /// stays whole, so a keystroke that merely reorders rows does not blink them.
+    #[test]
+    fn fresh_rows_fade_in_and_survivors_stay_whole() {
+        assert_eq!(
+            fresh_alpha(None),
+            255,
+            "no refresh running: everything whole"
+        );
+        assert_eq!(
+            fresh_alpha(Some(Duration::ZERO)),
+            0,
+            "a new row arrives empty"
+        );
+        let mid = fresh_alpha(Some(CONTENT / 2));
+        assert!(mid > 0 && mid < 255, "mid-flight: {mid}");
+        assert_eq!(fresh_alpha(Some(CONTENT)), 255, "settles exactly opaque");
+        assert_eq!(fresh_alpha(Some(CONTENT * 2)), 255);
+
+        // Identity, not position: index 7 was on screen, so it is whole at once.
+        assert_eq!(row_fade(&[7, 3], 7, Some(Duration::ZERO)), 255);
+        assert_eq!(row_fade(&[7, 3], 9, Some(Duration::ZERO)), 0);
+        assert_eq!(row_fade(&[], 7, None), 255);
+    }
+
+    /// The overlay thumb is full at the moment the list moves and gone
+    /// `SCROLL_FADE` later, so it does not sit on the list while you read it.
+    #[test]
+    fn scrollbar_fades_out_after_the_list_stops_moving() {
+        assert_eq!(scroll_alpha(None), 0, "never moved: no thumb");
+        assert_eq!(scroll_alpha(Some(Duration::ZERO)), 255);
+        let mid = scroll_alpha(Some(SCROLL_FADE / 2));
+        assert!(mid > 0 && mid < 255, "fading: {mid}");
+        assert_eq!(scroll_alpha(Some(SCROLL_FADE)), 0);
+        assert_eq!(scroll_alpha(Some(SCROLL_FADE * 2)), 0);
     }
 }
