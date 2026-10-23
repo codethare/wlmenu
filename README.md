@@ -26,9 +26,10 @@ the whole UI is drawn by `ab_glyph`.
 - Spotlight-style UI: rounded corners; the input bar and the result list are two
   separate cards with an 8 px gap between them; launch shows only the input bar in the
   upper-center of the screen, results appear as you type, and the menu
-  collapses back to the bar when the query is cleared. Height changes ease over
-  180 ms on an ease-in-out curve instead of jumping. With `-p` the list is shown
-  from the start and Enter takes the highlighted row, so
+  collapses back to the bar when the query is cleared. The panel fades in when it
+  opens and fades out before it exits, and height changes ease over 180 ms on an
+  ease-in-out curve instead of jumping. With `-p` the list is shown from the
+  start and Enter takes the highlighted row, so
   `printf 'no\nyes' | wlmenu -p 'Suspend?'` is a usable confirm dialog
 - the panel is translucent glass: an antialiased rounded edge, a hairline along
   it, and a two-layer drop shadow that wraps the rounded corners instead of being

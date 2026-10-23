@@ -240,6 +240,25 @@ fn premul(c: Bgra) -> Bgra {
     ]
 }
 
+/// Fade the whole frame: multiply every channel by `a`. The buffer is
+/// premultiplied BGRA, so a plain scale *is* an opacity change — no per-pixel
+/// colour work needed.
+pub fn fade(buf: &mut [u8], a: f32) {
+    let k = (a.clamp(0.0, 1.0) * 256.0) as u32;
+    if k >= 256 {
+        return;
+    }
+    if k == 0 {
+        buf.fill(0);
+        return;
+    }
+    for px in buf.as_chunks_mut::<4>().0 {
+        for c in px.iter_mut() {
+            *c = (*c as u32 * k / 256) as u8;
+        }
+    }
+}
+
 /// Composite an already premultiplied source over a premultiplied destination
 /// with `cov` (0-255) attenuating it — edge coverage, or a border layer.
 #[inline]
@@ -527,15 +546,60 @@ fn body(buf: &mut [u8], w: u32, panel: &Panel, bg: Bgra) {
     }
 }
 
-/// Draws the full frame. `buf` is `w*h*4` bytes in BGRA order.
-/// The first row is the prompt/input row, the rest are `rows`.
-/// `scale` is the buffer-to-logical density (HiDPI): `padding` and this
-/// module's geometry constants are logical and are multiplied by it here.
+/// Draws a frame whose cards fill the buffer: the shape every test renders.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     buf: &mut [u8],
     w: u32,
     h: u32,
+    font: &crate::font::MenuFont,
+    prompt: &str,
+    query: &str,
+    password: bool,
+    rows: &[Row],
+    padding: u32,
+    colors: &Colors,
+    scale: u32,
+    caret_visible: bool,
+    subpixel: Subpixel,
+) {
+    let panel_h = h.saturating_sub(2 * SHADOW * scale.max(1));
+    draw_panel(
+        buf,
+        w,
+        h,
+        panel_h,
+        false,
+        font,
+        prompt,
+        query,
+        password,
+        rows,
+        padding,
+        colors,
+        scale,
+        caret_visible,
+        subpixel,
+    );
+}
+
+/// Draws the full frame. `buf` is `w*h*4` bytes in BGRA order.
+/// The first row is the prompt/input row, the rest are `rows`.
+/// `scale` is the buffer-to-logical density (HiDPI): `padding` and this
+/// module's geometry constants are logical and are multiplied by it here.
+///
+/// `panel_h` is the *animated* card height: the surface stays big enough for the
+/// whole transition, so the cards are drawn inside it, anchored the way the
+/// compositor anchors the surface (`bottom`): their top edge or their bottom edge
+/// stays put, and the rest of the buffer is left transparent.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_panel(
+    buf: &mut [u8],
+    w: u32,
+    h: u32,
+    panel_h: u32,
+    bottom: bool,
     font: &crate::font::MenuFont,
     prompt: &str,
     query: &str,
@@ -561,15 +625,16 @@ pub fn draw(
     // The buffer is the panel plus its shadow margin. The shadow pass also
     // empties everything it does not paint (the buffer can be a different slot
     // each frame), so there is no separate clear.
-    if w <= 2 * mo || h <= 2 * mo {
+    if w <= 2 * mo || h <= 2 * mo || panel_h == 0 {
         buf.fill(0);
         return;
     }
+    let panel_h = panel_h.min(h - 2 * mo);
     let column = Panel {
         x: mo,
-        y: mo,
+        y: if bottom { h - mo - panel_h } else { mo },
         w: w - 2 * mo,
-        h: h - 2 * mo,
+        h: panel_h,
         r: CORNER_RADIUS * s,
     };
     // Two cards: the input bar, and the list floating `sep` below it.
@@ -1410,6 +1475,61 @@ mod tests {
             "the lower wall is in shadow: band {:?} against body {body:?}",
             px(1, deep)
         );
+    }
+
+    /// The surface is sized for a whole transition, so the cards are drawn at the
+    /// animated height inside it: the rest stays transparent, and the cards stay
+    /// anchored to the edge the compositor pins them to.
+    #[test]
+    fn cards_are_drawn_at_the_animated_height_inside_a_larger_surface() {
+        let font = MenuFont::load(None, 20.0).expect("system font available");
+        let panel = frame_h(font.row_h, 3, 1);
+        let mid = panel / 2;
+        let (bw, bh) = frame_size(300, panel, 1);
+        for bottom in [false, true] {
+            let mut buf = vec![1u8; (bw * bh * 4) as usize];
+            draw_panel(
+                &mut buf,
+                bw,
+                bh,
+                mid,
+                bottom,
+                &font,
+                "",
+                "",
+                false,
+                &[],
+                PAD,
+                &Colors::default(),
+                1,
+                false,
+                Subpixel::Gray,
+            );
+            let px = |x: u32, y: u32| &buf[idx(bw, 1, x, y)..][..4];
+            let (body, clear) = if bottom {
+                (panel - CORNER_RADIUS, CORNER_RADIUS)
+            } else {
+                (CORNER_RADIUS, panel - CORNER_RADIUS)
+            };
+            assert_ne!(px(150, body), &[0, 0, 0, 0], "cards at panel y={body}");
+            assert_eq!(
+                px(150, clear),
+                &[0, 0, 0, 0],
+                "leftover surface stays clear at panel y={clear}"
+            );
+        }
+    }
+
+    /// Opacity is a plain scale on premultiplied pixels: full, half, nothing.
+    #[test]
+    fn fade_scales_the_whole_frame_and_clears_it_at_zero() {
+        let mut buf = vec![255u8; 16];
+        fade(&mut buf, 1.0);
+        assert_eq!(buf, vec![255u8; 16], "a full fade changes nothing");
+        fade(&mut buf, 0.5);
+        assert!(buf.iter().all(|&c| c == 127 || c == 128), "{buf:?}");
+        fade(&mut buf, 0.0);
+        assert_eq!(buf, vec![0u8; 16], "zero opacity is fully transparent");
     }
 
     /// The shadow wraps a corner instead of being cut off at it: measured straight

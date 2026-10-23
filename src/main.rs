@@ -26,7 +26,7 @@ use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 
 use smithay_client_toolkit::{
     activation::{ActivationHandler, ActivationState, RequestData},
-    compositor::{CompositorHandler, CompositorState, FrameCallbackData},
+    compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region},
     delegate_registry,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -299,6 +299,8 @@ fn main() {
         anim: None,
         target_h: None,
         shown_h: bar_h,
+        closing: false,
+        sent: Sent::default(),
         first_configure: true,
         run: opts.run,
         launches: Vec::new(),
@@ -390,7 +392,7 @@ fn main() {
         // blink is the only thing left. Wayland input wakes the loop
         // immediately, so an idle menu goes from ~62 wakeups/s to ~2/s.
         let now = Instant::now();
-        let busy = app.streaming() || app.anim.as_ref().is_some_and(|a| a.height(now).1);
+        let busy = app.streaming() || app.anim.as_ref().is_some_and(|a| a.at(now).2);
         if event_loop
             .dispatch(loop_timeout(busy, app.next_blink, now), &mut app)
             .is_err()
@@ -401,7 +403,12 @@ fn main() {
         app.sync_items();
         app.tick();
         if app.menu.done.is_some() {
-            break;
+            // Play the exit transition before finishing: printing, launching and
+            // the exit code all wait for it.
+            app.begin_close();
+            if app.close_finished() {
+                break;
+            }
         }
     }
     app.finish();
@@ -687,6 +694,18 @@ impl MenuState {
     }
 }
 
+/// What the layer surface was last told, so a frame whose geometry did not change
+/// sends no requests. Only changes cost a compositor reflow.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct Sent {
+    size: Option<(u32, u32)>,
+    margin: Option<(i32, i32, i32, i32)>,
+    scale: Option<u32>,
+    /// Input region as (y, height) in surface-logical pixels; the width is the
+    /// whole surface.
+    input: Option<(u32, u32)>,
+}
+
 #[allow(dead_code)] // state objects kept alive for their proxy bindings
 struct App {
     registry_state: RegistryState,
@@ -746,11 +765,17 @@ struct App {
     /// Caret blink state and when to toggle it next (typing keeps it solid).
     blink: bool,
     next_blink: Instant,
-    /// Height transition in flight, the height it is heading for, and the height
+    /// Height and opacity transition in flight, its destination, and the height
     /// last rendered (the animation's starting point).
     anim: Option<Anim>,
     target_h: Option<u32>,
     shown_h: u32,
+    /// The menu is on its way out: the cards fade and shrink, then the process
+    /// finishes with whatever `done` says.
+    closing: bool,
+    /// What the layer surface was last told, so frames that change nothing in its
+    /// geometry send no requests.
+    sent: Sent,
     first_configure: bool,
     run: bool,
     /// `--run` picks waiting to be spawned. Filled from key handlers, drained
@@ -890,10 +915,10 @@ impl App {
     /// Caret blink: toggle every `BLINK_PERIOD` while idle. Typing calls
     /// `wake_caret` so the caret stays solid while the user is working.
     fn tick(&mut self) {
-        // Keep a height transition moving; the loop's 16 ms timeout is our
-        // frame clock (the Wayland frame callback only paces real frames).
+        // Keep a transition moving; the loop's 16 ms timeout is our frame clock
+        // (the Wayland frame callback only paces real frames).
         if let Some(a) = &self.anim
-            && a.height(Instant::now()).1
+            && a.at(Instant::now()).2
         {
             self.request_draw();
         }
@@ -911,6 +936,9 @@ impl App {
     }
 
     fn on_key(&mut self, keysym: Keysym, utf8: Option<String>) {
+        if self.closing {
+            return;
+        }
         self.sync_items();
         self.wake_caret();
         let visible = self.visible();
@@ -1032,48 +1060,72 @@ impl App {
             } else {
                 0
             };
-        // Smooth every height change: the bar expanding into a list, the list
-        // growing/shrinking as the query narrows, and the collapse back to the
-        // bar. Each new target restarts the ease from what is on screen now.
+        // Smooth every change: the bar appearing, the list expanding under a
+        // keystroke, the collapse back to the bar, and the fade-out on the way
+        // out. Each new destination restarts the ease from what is on screen now,
+        // and keeps the opacity it is at, so the three never fight each other.
         let now = Instant::now();
+        let target = if self.closing { 0 } else { target };
         if self.target_h != Some(target) {
+            let from_a = self.anim.as_ref().map_or(1.0, |a| a.at(now).1);
             self.anim = Some(Anim {
-                from: self.shown_h,
-                to: target,
+                from_h: self.shown_h,
+                to_h: target,
+                from_a,
+                to_a: if self.closing { 0.0 } else { 1.0 },
                 start: now,
             });
             self.target_h = Some(target);
         }
-        let (h, running) = self
+        let (h, alpha, running) = self
             .anim
             .as_ref()
-            .map_or((target, false), |a| a.height(now));
+            .map_or((target, 1.0, false), |a| a.at(now));
         if !running {
             self.anim = None;
         }
         self.shown_h = h;
-        // The shadow margin hangs into the screen edge, so the surface margin is
-        // the panel's visible gap minus that margin: the panel keeps its old
-        // position at the top, and floats there in bottom mode too.
+        // The surface is sized for the whole transition — the further of its two
+        // ends — so the cards animate *inside* it and the compositor never has to
+        // reflow the scene per frame.
+        let surface_h = match &self.anim {
+            Some(a) => a.from_h.max(a.to_h),
+            None => target,
+        };
+        // Where the cards sit inside that surface, and so where clicks land: the
+        // shadow margin hangs into the screen edge, so the surface margin is the
+        // panel's visible gap minus the margin the shadow already occupies. The
+        // panel keeps its old position at the top, and floats there in bottom mode.
         let shadow = render::SHADOW as i32;
-        if self.bottom {
-            layer.set_margin(0, 0, 0, 0);
+        let margin = if self.bottom {
+            (0, 0, 0, 0)
         } else {
             // Upper-center, horizontally centered on the whole surface.
             let left = self
                 .output_w
                 .map(|ow| ((ow as i64 - (w + 2 * render::SHADOW) as i64) / 2).max(0) as i32)
                 .unwrap_or(0);
-            layer.set_margin(TOP_MARGIN - shadow, 0, 0, left);
+            (TOP_MARGIN - shadow, 0, 0, left)
+        };
+        if self.sent.margin != Some(margin) {
+            layer.set_margin(margin.0, margin.1, margin.2, margin.3);
+            self.sent.margin = Some(margin);
         }
-        layer.set_size(
+        let size = (
             w + 2 * render::SHADOW,
-            h.div_ceil(scale) + 2 * render::SHADOW,
+            surface_h.div_ceil(scale) + 2 * render::SHADOW,
         );
-        let _ = layer.set_buffer_scale(scale);
+        if self.sent.size != Some(size) {
+            layer.set_size(size.0, size.1);
+            self.sent.size = Some(size);
+        }
+        if self.sent.scale != Some(scale) {
+            let _ = layer.set_buffer_scale(scale);
+            self.sent.scale = Some(scale);
+        }
 
         let bw = (w + 2 * render::SHADOW) * scale;
-        let bh = h + 2 * render::SHADOW * scale;
+        let bh = surface_h + 2 * render::SHADOW * scale;
         let (buffer, canvas) = match self.pool.create_buffer(
             bw as i32,
             bh as i32,
@@ -1089,10 +1141,12 @@ impl App {
         };
         // Content inset follows the text (0.8 em), from the size actually loaded.
         let pad = pad_for(font.size / scale as f32);
-        render::draw(
+        render::draw_panel(
             canvas,
             bw,
             bh,
+            h,
+            self.bottom,
             font,
             &self.prompt,
             &self.menu.query,
@@ -1128,6 +1182,22 @@ impl App {
             );
         }
 
+        render::fade(canvas, alpha);
+
+        // Clicks belong to the cards, not to the transparent rest of the surface
+        // the transition needs; the region only moves when the cards do.
+        let input = (h + 2 * render::SHADOW * scale).div_ceil(scale);
+        let input = (if self.bottom { size.1 - input } else { 0 }, input);
+        if self.sent.input != Some(input)
+            && let Ok(region) = Region::new(&self.compositor)
+        {
+            region.add(0, input.0 as i32, size.0 as i32, input.1 as i32);
+            layer
+                .wl_surface()
+                .set_input_region(Some(region.wl_region()));
+            self.sent.input = Some(input);
+        }
+
         layer.wl_surface().damage_buffer(0, 0, bw as i32, bh as i32);
         let surface = layer.wl_surface().clone();
         surface.frame(&self.qh, FrameCallbackData(surface.clone()));
@@ -1138,6 +1208,33 @@ impl App {
         layer.commit();
         self.frame_pending = true;
         self.dirty = false;
+    }
+
+    /// Start the exit transition. Nothing to animate when there is nothing to
+    /// show (stdin was empty), so those exits stay immediate.
+    fn begin_close(&mut self) {
+        if self.closing || self.no_items {
+            return;
+        }
+        self.closing = true;
+        // Started here rather than in the next draw: a frame may already be in
+        // flight, and the exit must not be skipped because of it.
+        let now = Instant::now();
+        let from_a = self.anim.as_ref().map_or(1.0, |a| a.at(now).1);
+        self.anim = Some(Anim {
+            from_h: self.shown_h,
+            to_h: 0,
+            from_a,
+            to_a: 0.0,
+            start: now,
+        });
+        self.target_h = Some(0);
+        self.request_draw();
+    }
+
+    /// True once the exit transition has played out, or there was none to play.
+    fn close_finished(&self) -> bool {
+        self.closing && self.anim.as_ref().is_none_or(|a| !a.at(Instant::now()).2)
     }
 
     fn finish(&mut self) {
@@ -1231,6 +1328,16 @@ impl LayerShellHandler for App {
     ) {
         if self.first_configure {
             self.first_configure = false;
+            // Appearance: fade in at the bar's height. Started here rather than at
+            // construction, which can be a whole font load earlier than this frame.
+            let h = self.shown_h;
+            self.anim = Some(Anim {
+                from_h: h,
+                to_h: h,
+                from_a: 0.0,
+                to_a: 1.0,
+                start: Instant::now(),
+            });
             self.draw();
         } else {
             self.request_draw();
