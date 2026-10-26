@@ -14,3 +14,10 @@ ab_glyph = "0.2.32"
 fontdb = "0.24.0"
 smithay-client-toolkit = "0.21.1"
 wayland-client = "0.31.14"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
