@@ -418,7 +418,7 @@ fn main() {
         // immediately, so an idle menu goes from ~62 wakeups/s to ~2/s.
         let now = Instant::now();
         let busy = app.streaming()
-            || app.anim.as_ref().is_some_and(|a| a.at(now).2)
+            || app.anim_running()
             || app.content_fading(now)
             || app.scroll_fading(now);
         if event_loop
@@ -434,12 +434,19 @@ fn main() {
             // Play the exit transition before finishing: printing, launching and
             // the exit code all wait for it.
             app.begin_close();
-            if app.close_finished() {
-                break;
-            }
+        }
+        if should_finish(app.menu.done.is_some(), app.closing, app.anim_running()) {
+            break;
         }
     }
     app.finish();
+}
+
+/// Whether the loop may hand over to `finish()`. The exit transition plays first,
+/// but only when there is one: a close with nothing to animate (`no_items`) must
+/// end the loop at once instead of spinning on a state that never changes.
+fn should_finish(done: bool, closing: bool, running: bool) -> bool {
+    done && (!closing || !running)
 }
 
 /// How long the event loop may sleep. `busy` covers everything that needs the
@@ -901,6 +908,11 @@ impl App {
         Some(max_rows(output_h, row_h, top, bottom, self.scale))
     }
 
+    /// True while a transition is still moving, whichever one it is.
+    fn anim_running(&self) -> bool {
+        self.anim.as_ref().is_some_and(|a| a.at(Instant::now()).2)
+    }
+
     /// True while stdin is still feeding items in (`--run` never streams).
     fn streaming(&self) -> bool {
         self.feed.as_ref().is_some_and(|f| !f.done())
@@ -1012,10 +1024,7 @@ impl App {
         // Keep a transition moving; the loop's 16 ms timeout is our frame clock
         // (the Wayland frame callback only paces real frames). The row fade-in and
         // the scrollbar fade need the same clock.
-        if self.anim.as_ref().is_some_and(|a| a.at(now).2)
-            || self.content_fading(now)
-            || self.scroll_fading(now)
-        {
+        if self.anim_running() || self.content_fading(now) || self.scroll_fading(now) {
             self.request_draw();
         }
         if now < self.next_blink {
@@ -1371,11 +1380,6 @@ impl App {
         self.request_draw();
     }
 
-    /// True once the exit transition has played out, or there was none to play.
-    fn close_finished(&self) -> bool {
-        self.closing && self.anim.as_ref().is_none_or(|a| !a.at(Instant::now()).2)
-    }
-
     fn finish(&mut self) {
         if self.no_items {
             eprintln!("wlmenu: no items");
@@ -1637,6 +1641,26 @@ mod tests {
             Some("HDMI-A-1")
         );
         assert_eq!(opts(&[]).output, None);
+    }
+
+    /// The four states the exit decision can be in. The third row is the one that
+    /// shipped broken: an empty item list sets `done`, `begin_close` starts no
+    /// transition, and the loop kept running with the keyboard grabbed.
+    #[test]
+    fn the_loop_waits_for_an_exit_transition_but_not_for_a_missing_one() {
+        assert!(
+            !should_finish(false, false, false),
+            "nothing pending: keep running"
+        );
+        assert!(
+            should_finish(true, false, false),
+            "nothing to animate: finish now"
+        );
+        assert!(
+            !should_finish(true, true, true),
+            "exit transition playing: wait for it"
+        );
+        assert!(should_finish(true, true, false), "transition over: finish");
     }
 
     #[test]
